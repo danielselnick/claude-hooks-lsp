@@ -11,8 +11,9 @@ import os
 import socket
 import sys
 import time
+import uuid
 
-from lsp_hooks_paths import LOG_PATH, SOCKET_PATH, PID_PATH
+from lsp_hooks_paths import LOG_PATH, SOCKET_PATH, PID_PATH, VERSION_PATH
 
 logging.basicConfig(
     filename=LOG_PATH,
@@ -30,14 +31,6 @@ SUPPORTED_EXTENSIONS = frozenset((
     ".cs",
 ))
 EXCLUDED_PATHS = ("target/", ".git/", "node_modules/")
-BUDGETS_MS = {
-    "pre-write": 2000,
-    "pre-read": 1000,
-    "pre-bash": 1000,
-    "prompt": 2000,
-    "session-start": 3000,
-}
-
 
 def _try_start_daemon():
     """Auto-start daemon if not running. Returns True if started."""
@@ -65,6 +58,7 @@ def _try_start_daemon():
 
 def main():
     t0 = time.monotonic()
+    rid = uuid.uuid4().hex[:8]
 
     # Recursion guard
     if os.environ.get("LSP_HOOKS_ACTIVE"):
@@ -94,14 +88,15 @@ def main():
         print("lsp-hooks: stdin parse error", file=sys.stderr)
         sys.exit(1)
 
-    log.info(">>> event=%s tool=%s file=%s",
-             event,
+    log.info("[%s] >>> event=%s tool=%s file=%s",
+             rid, event,
              hook_input.get("tool_name", "-"),
              hook_input.get("tool_input", {}).get("file_path", "-"))
-    log.debug(">>> stdin: %s", json.dumps(hook_input, default=str)[:2000])
+    log.debug("[%s] >>> stdin: %s", rid, json.dumps(hook_input, default=str)[:2000])
 
     cwd = hook_input.get("cwd", "")
     tool_input = hook_input.get("tool_input", {})
+    permission_mode = hook_input.get("permission_mode", "default")
 
     # Extract file_path for file-specific events
     file_path = ""
@@ -128,17 +123,35 @@ def main():
                 log.debug("skipped: excluded path %s", excl)
                 return
 
-    # Connect to daemon (auto-start on first failure)
-    budget_ms = BUDGETS_MS.get(event, 2000)
-    sock_timeout = max((budget_ms - 200) / 1000.0, 0.3)
+    # Check for version mismatch — restart daemon on upgrade
+    try:
+        plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(plugin_root, ".claude-plugin", "plugin.json")) as f:
+            current_version = json.loads(f.read()).get("version", "")
+        running_version = ""
+        if os.path.exists(VERSION_PATH):
+            with open(VERSION_PATH) as f:
+                running_version = f.read().strip()
+        if current_version and running_version and current_version != running_version:
+            log.info("version mismatch: running=%s current=%s — restarting daemon", running_version, current_version)
+            if os.path.exists(PID_PATH):
+                with open(PID_PATH) as f:
+                    old_pid = int(f.read().strip())
+                os.kill(old_pid, 15)  # SIGTERM
+                time.sleep(0.3)
+            _try_start_daemon()
+            time.sleep(0.5)
+    except Exception as e:
+        log.debug("version check skipped: %s", e)
 
+    # Connect to daemon (auto-start on first failure)
     sock = None
     for attempt in range(2):
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.settimeout(CONNECT_TIMEOUT)
             sock.connect(SOCKET_PATH)
-            sock.settimeout(sock_timeout)
+            sock.settimeout(None)  # blocking — Claude Code's hook timeout is the backstop
             break
         except (socket.error, OSError) as e:
             if attempt == 0:
@@ -156,14 +169,16 @@ def main():
     try:
         req_obj = {
             "method": "query",
+            "request_id": rid,
             "params": {
                 "event": event,
                 "file_path": file_path,
                 "tool_input": tool_input,
                 "cwd": cwd,
+                "permission_mode": permission_mode,
             },
         }
-        log.debug(">>> daemon request: %s", json.dumps(req_obj, default=str)[:2000])
+        log.debug("[%s] >>> daemon request: %s", rid, json.dumps(req_obj, default=str)[:2000])
         request = json.dumps(req_obj) + "\n"
         sock.sendall(request.encode())
 
@@ -183,7 +198,7 @@ def main():
 
         response = json.loads(buf.decode().split("\n", 1)[0])
     except (socket.timeout, socket.error, json.JSONDecodeError, OSError) as e:
-        log.warning("daemon communication error: %s (%.0fms)", e, (time.monotonic() - t0) * 1000)
+        log.warning("[%s] daemon communication error: %s (%.0fms)", rid, e, (time.monotonic() - t0) * 1000)
         try:
             sock.close()
         except Exception:
@@ -191,16 +206,16 @@ def main():
         return
 
     elapsed_ms = (time.monotonic() - t0) * 1000
-    log.debug("<<< daemon response: %s", json.dumps(response, default=str)[:2000])
+    log.debug("[%s] <<< daemon response: %s", rid, json.dumps(response, default=str)[:2000])
 
     context = response.get("context", "")
     if not context:
-        log.info("<<< empty context (%.0fms)", elapsed_ms)
+        log.info("[%s] <<< empty context (%.0fms)", rid, elapsed_ms)
         return
 
     # Emit hook output — systemMessage injects context for Claude
     output = {"continue": True, "systemMessage": context}
-    log.info("<<< output (%d chars, %.0fms): %s", len(context), elapsed_ms, context[:200])
+    log.info("[%s] <<< output (%d chars, %.0fms): %s%s", rid, len(context), elapsed_ms, context[:128], "… [truncated]" if len(context) > 128 else "")
     print(json.dumps(output))
 
 

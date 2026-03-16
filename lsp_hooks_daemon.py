@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """LSP Hooks Daemon — persistent process managing lsp-mcp-server over stdio."""
 
+from __future__ import annotations
+
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -9,9 +12,11 @@ import re
 import signal
 import sys
 import time
+import uuid
 from pathlib import Path
 
-from lsp_hooks_paths import LOG_PATH, SOCKET_PATH, PID_PATH
+from lsp_hooks_paths import LOG_PATH, SOCKET_PATH, PID_PATH, VERSION_PATH, CACHE_DB_PATH
+from lsp_hooks_cache import SQLiteCache
 
 logging.basicConfig(
     filename=LOG_PATH,
@@ -21,6 +26,13 @@ logging.basicConfig(
 )
 log = logging.getLogger("lsp_hooks_daemon")
 
+_request_id: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="--------")
+
+
+def _rid() -> str:
+    return _request_id.get()
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -29,13 +41,7 @@ DEFAULTS = {
     "lsp_mcp_server_path": "",
     "socket_path": SOCKET_PATH,
     "pid_path": PID_PATH,
-    "budgets": {
-        "pre_write_ms": 2000,
-        "pre_read_ms": 1000,
-        "pre_bash_ms": 1000,
-        "prompt_ms": 2000,
-        "session_start_ms": 3000,
-    },
+    "version_path": VERSION_PATH,
     "limits": {
         "max_symbols_per_file": 5,
         "max_callers_shown": 3,
@@ -194,7 +200,7 @@ class MCPClient:
                     fut.set_exception(ConnectionError("MCP reader stopped"))
             self._pending.clear()
 
-    async def _call(self, method: str, params: dict, timeout: float = 10.0):
+    async def _call(self, method: str, params: dict):
         req_id = self._next_id
         self._next_id += 1
         fut = asyncio.get_event_loop().create_future()
@@ -205,36 +211,32 @@ class MCPClient:
                     "jsonrpc": "2.0", "id": req_id,
                     "method": method, "params": params,
                 })
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
+            return await fut
+        finally:
             self._pending.pop(req_id, None)
-            raise TimeoutError(f"MCP timeout id={req_id}")
-        except Exception:
-            self._pending.pop(req_id, None)
-            raise
 
     # -- public API --
 
-    async def tools_call(self, tool_name: str, arguments: dict, timeout: float = 5.0):
+    async def tools_call(self, tool_name: str, arguments: dict):
         t0 = time.monotonic()
-        log.debug("MCP >>> %s(%s)", tool_name, json.dumps(arguments, default=str)[:500])
+        log.debug("[%s] MCP >>> %s(%s)", _rid(), tool_name, json.dumps(arguments, default=str)[:500])
         resp = await self._call("tools/call", {
             "name": tool_name, "arguments": arguments,
-        }, timeout=timeout)
+        })
         elapsed = (time.monotonic() - t0) * 1000
         if "error" in resp:
-            log.warning("MCP <<< %s ERROR (%.0fms): %s", tool_name, elapsed,
+            log.warning("[%s] MCP <<< %s ERROR (%.0fms): %s", _rid(), tool_name, elapsed,
                         json.dumps(resp["error"], default=str)[:300])
             return None
         content = resp.get("result", {}).get("content", [])
         if content and content[0].get("type") == "text":
             raw_text = content[0].get("text", "")
-            log.debug("MCP <<< %s OK (%.0fms, %d chars)", tool_name, elapsed, len(raw_text))
+            log.debug("[%s] MCP <<< %s OK (%.0fms, %d chars)", _rid(), tool_name, elapsed, len(raw_text))
             try:
                 return json.loads(raw_text)
             except (json.JSONDecodeError, KeyError):
                 return raw_text
-        log.debug("MCP <<< %s OK (%.0fms, no text content)", tool_name, elapsed)
+        log.debug("[%s] MCP <<< %s OK (%.0fms, no text content)", _rid(), tool_name, elapsed)
         return resp.get("result")
 
     def is_alive(self) -> bool:
@@ -470,9 +472,11 @@ class LSPHooksDaemon:
         log.info("MCP server: %s (npx=%s)", server_path, is_npx)
         self.mcp = MCPClient(server_path, is_npx=is_npx)
         self.cache = Cache(config["cache_ttl_seconds"])
+        self.sqlite_cache = SQLiteCache(CACHE_DB_PATH)
         self.recent_writes: list[str] = []
         self.recent_reads: set[str] = set()
         self._server = None
+        self._last_permission_mode = "default"
 
     # -- lifecycle --
 
@@ -482,6 +486,18 @@ class LSPHooksDaemon:
 
         with open(pid_path, "w") as f:
             f.write(str(os.getpid()))
+
+        # Write current version so the hook client can detect upgrades
+        try:
+            plugin_json = Path(__file__).resolve().parent / ".claude-plugin" / "plugin.json"
+            version = json.loads(plugin_json.read_text()).get("version", "unknown")
+        except Exception:
+            version = "unknown"
+        version_path = self.cfg.get("version_path", "")
+        if version_path:
+            with open(version_path, "w") as f:
+                f.write(version)
+            log.info("wrote version %s to %s", version, version_path)
 
         if os.path.exists(socket_path):
             os.unlink(socket_path)
@@ -501,7 +517,8 @@ class LSPHooksDaemon:
             self._server.close()
             await self._server.wait_closed()
         await self.mcp.stop()
-        for p in (self.cfg["socket_path"], self.cfg["pid_path"]):
+        self.sqlite_cache.close()
+        for p in (self.cfg["socket_path"], self.cfg["pid_path"], self.cfg.get("version_path", "")):
             if os.path.exists(p):
                 os.unlink(p)
 
@@ -527,9 +544,21 @@ class LSPHooksDaemon:
                         print(f"[lsp-hooks] restart failed: {e}", file=sys.stderr)
                 await asyncio.sleep(5)
 
+        async def _cache_evictor():
+            while not stop.is_set():
+                await asyncio.sleep(600)  # 10 minutes
+                if self._last_permission_mode == "plan":
+                    continue  # Never evict during plan mode
+                try:
+                    self.sqlite_cache.evict_stale()
+                except Exception as e:
+                    log.warning("cache eviction error: %s", e)
+
         wd = asyncio.create_task(_watchdog())
+        ev = asyncio.create_task(_cache_evictor())
         await stop.wait()
         wd.cancel()
+        ev.cancel()
         await self.cleanup()
         print("[lsp-hooks] stopped", file=sys.stderr)
 
@@ -538,12 +567,13 @@ class LSPHooksDaemon:
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         t0 = time.monotonic()
         try:
-            data = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            data = await reader.readline()
             if not data:
                 return
             req = json.loads(data.decode().strip())
+            _request_id.set(req.get("request_id", uuid.uuid4().hex[:8]))
             method = req.get("method")
-            log.info("socket >>> method=%s params=%s", method,
+            log.info("[%s] socket >>> method=%s params=%s", _rid(), method,
                      json.dumps(req.get("params", {}), default=str)[:500])
             if method == "ping":
                 resp = {"ok": True, "pong": True}
@@ -553,16 +583,16 @@ class LSPHooksDaemon:
                 resp = {"ok": False, "error": f"unknown method: {method}"}
             elapsed = (time.monotonic() - t0) * 1000
             ctx_len = len(resp.get("context", ""))
-            log.info("socket <<< ok=%s context=%d chars (%.0fms): %s",
-                     resp.get("ok"), ctx_len, elapsed,
+            log.info("[%s] socket <<< ok=%s context=%d chars (%.0fms): %s",
+                     _rid(), resp.get("ok"), ctx_len, elapsed,
                      resp.get("context", resp.get("error", ""))[:300])
             writer.write((json.dumps(resp) + "\n").encode())
             await writer.drain()
         except ConnectionResetError:
             elapsed = (time.monotonic() - t0) * 1000
-            log.debug("client disconnected before response (%.0fms)", elapsed)
+            log.debug("[%s] client disconnected before response (%.0fms)", _rid(), elapsed)
         except Exception as e:
-            log.exception("socket handler error: %s", e)
+            log.exception("[%s] socket handler error: %s", _rid(), e)
             try:
                 writer.write((json.dumps({"ok": False, "error": str(e)}) + "\n").encode())
                 await writer.drain()
@@ -582,6 +612,9 @@ class LSPHooksDaemon:
         file_path = params.get("file_path", "")
         tool_input = params.get("tool_input", {})
         cwd = params.get("cwd", "")
+        permission_mode = params.get("permission_mode", "default")
+
+        self._last_permission_mode = permission_mode
 
         if not self.mcp.is_alive():
             try:
@@ -592,7 +625,7 @@ class LSPHooksDaemon:
         cache_key = f"{event}:{file_path}"
         cached = self.cache.get(cache_key)
         if cached is not None:
-            log.info("cache HIT for %s", cache_key)
+            log.info("[%s] L1 cache HIT for %s", _rid(), cache_key)
             return {"ok": True, "context": cached}
 
         handlers = {
@@ -606,49 +639,48 @@ class LSPHooksDaemon:
         if not handler:
             return {"ok": False, "error": f"unknown event: {event}"}
 
-        budget_map = {
-            "pre-read": "pre_read_ms",
-            "pre-write": "pre_write_ms",
-            "pre-bash": "pre_bash_ms",
-            "prompt": "prompt_ms",
-            "session-start": "session_start_ms",
-        }
-        budget_ms = self.cfg["budgets"].get(budget_map.get(event, ""), 2000)
-        # Client socket timeout = (budget_ms - 200) / 1000.
-        # Daemon must finish before client disconnects, so use budget - 300ms.
-        daemon_timeout = max((budget_ms - 300) / 1000.0, 0.2)
-
         try:
-            ctx = await asyncio.wait_for(
-                handler(file_path, tool_input, cwd),
-                timeout=daemon_timeout,
-            )
+            ctx = await handler(file_path, tool_input, cwd)
             if ctx:
                 self.cache.set(cache_key, ctx)
                 return {"ok": True, "context": ctx}
             return {"ok": True, "context": ""}
-        except asyncio.TimeoutError:
-            return {"ok": True, "context": "[LSP: query timed out]"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
     # -- safe MCP wrapper --
 
-    async def _tc(self, tool: str, args: dict, timeout: float = 4.0):
+    async def _tc(self, tool: str, args: dict):
         try:
-            return await self.mcp.tools_call(tool, args, timeout=timeout)
+            return await self.mcp.tools_call(tool, args)
         except Exception as e:
-            log.warning("_tc(%s) failed: %s", tool, e)
+            log.warning("[%s] _tc(%s) failed: %s", _rid(), tool, e)
             return None
+
+    async def _tc_cached(self, tool: str, args: dict, file_path: str | None = None):
+        cached = self.sqlite_cache.get(tool, args, file_path=file_path)
+        if cached is not None:
+            log.debug("[%s] sqlite HIT for %s", _rid(), tool)
+            return cached
+
+        result = await self._tc(tool, args)
+
+        if result is not None:
+            self.sqlite_cache.put(tool, args, result, file_path=file_path)
+
+        return result
 
     # --------------- handlers ---------------
 
     async def _h_pre_read(self, file_path: str, tool_input: dict, cwd: str) -> str:
         self.recent_reads.add(file_path)
         syms_r, diag_r, exp_r = await asyncio.gather(
-            self._tc("lsp_document_symbols", {"file_path": file_path}),
-            self._tc("lsp_diagnostics", {"file_path": file_path, "severity_filter": "error"}),
-            self._tc("lsp_file_exports", {"file_path": file_path}),
+            self._tc_cached("lsp_document_symbols", {"file_path": file_path},
+                            file_path=file_path),
+            self._tc_cached("lsp_diagnostics", {"file_path": file_path, "severity_filter": "error"},
+                            file_path=file_path),
+            self._tc_cached("lsp_file_exports", {"file_path": file_path},
+                            file_path=file_path),
             return_exceptions=True,
         )
         syms_r = syms_r if not isinstance(syms_r, Exception) else None
@@ -695,12 +727,14 @@ class LSPHooksDaemon:
             if len(self.recent_writes) > 20:
                 self.recent_writes.pop(0)
 
-        # Invalidate stale caches
+        # Invalidate stale caches (L1 + L2)
         for ev in ("pre-read", "pre-write"):
             self.cache.invalidate(f"{ev}:{file_path}")
+        self.sqlite_cache.invalidate_file(file_path)
 
         # Step 1 — symbols (flatten tree to reach methods inside impl blocks)
-        syms_data = await self._tc("lsp_document_symbols", {"file_path": file_path})
+        syms_data = await self._tc_cached("lsp_document_symbols", {"file_path": file_path},
+                                          file_path=file_path)
         if not syms_data:
             return ""
         top_syms = _extract_symbols(syms_data)
@@ -737,12 +771,13 @@ class LSPHooksDaemon:
             col = sel.get("start", {}).get("column", sym.get("column", 1))
             ln = max(ln, 1)
             col = max(col, 1)
-            tasks.append(self._tc("lsp_smart_search", {
+            tasks.append(self._tc_cached("lsp_smart_search", {
                 "file_path": file_path, "line": ln, "column": col,
                 "include": ["hover", "references", "incoming_calls", "outgoing_calls", "implementations"],
                 "references_limit": 10,
-            }))
-        tasks.append(self._tc("lsp_file_exports", {"file_path": file_path}))
+            }, file_path=file_path))
+        tasks.append(self._tc_cached("lsp_file_exports", {"file_path": file_path},
+                                     file_path=file_path))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         smart = [r if not isinstance(r, Exception) else None for r in results[:len(relevant)]]
@@ -823,7 +858,8 @@ class LSPHooksDaemon:
 
         if self.recent_writes:
             tasks = [
-                self._tc("lsp_diagnostics", {"file_path": fp, "severity_filter": "error"})
+                self._tc_cached("lsp_diagnostics", {"file_path": fp, "severity_filter": "error"},
+                                file_path=fp)
                 for fp in self.recent_writes[-5:]
             ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -844,9 +880,9 @@ class LSPHooksDaemon:
             return "\n".join(lines) if has else ""
 
         # No recent writes — try workspace diagnostics
-        wd = await self._tc("lsp_workspace_diagnostics", {
+        wd = await self._tc_cached("lsp_workspace_diagnostics", {
             "severity_filter": "error", "limit": 10, "group_by": "file",
-        })
+        }, file_path=None)
         if not wd:
             return ""
         items = _extract_list(wd, "diagnostics", "items")
@@ -892,22 +928,19 @@ class LSPHooksDaemon:
         for etype, val in entities[:3]:
             try:
                 if etype == "file":
-                    res = await asyncio.wait_for(
-                        self._tc("lsp_document_symbols", {"file_path": val}), timeout=1.5,
-                    )
+                    res = await self._tc_cached("lsp_document_symbols", {"file_path": val},
+                                                file_path=val)
                     if res:
                         syms = _extract_symbols(res)
                         if syms:
                             flat = _flatten_symbols(syms)
                             lines.append(f"  {_rel(val, cwd)}: {_fmt_symbol_list(flat, limit=8)}")
                 else:
-                    res = await asyncio.wait_for(
-                        self._tc("lsp_find_symbol", {
-                            "name": val,
-                            "include": ["references", "incoming_calls", "outgoing_calls"],
-                            "references_limit": 5,
-                        }), timeout=1.5,
-                    )
+                    res = await self._tc_cached("lsp_find_symbol", {
+                        "name": val,
+                        "include": ["references", "incoming_calls", "outgoing_calls"],
+                        "references_limit": 5,
+                    }, file_path=None)
                     if res and isinstance(res, dict):
                         match = res.get("match", {})
                         if match:
@@ -923,22 +956,17 @@ class LSPHooksDaemon:
                                 c = _fmt_callers(ic, 3)
                                 if c:
                                     lines.append(f"    Called by: {c}")
-            except (asyncio.TimeoutError, Exception):
+            except Exception:
                 continue
 
         return "\n".join(lines) if len(lines) > 1 else ""
 
     async def _h_session_start(self, _file_path: str, _tool_input: dict, cwd: str) -> str:
-        res = None
         try:
-            res = await asyncio.wait_for(
-                self._tc("lsp_workspace_symbols", {"query": " ", "limit": 20}),
-                timeout=2.5,
-            )
-        except asyncio.TimeoutError:
-            return "[LSP] Language server starting up, context available shortly"
+            res = await self._tc_cached("lsp_workspace_symbols", {"query": " ", "limit": 20},
+                                        file_path=None)
         except Exception:
-            pass
+            return "[LSP] Language server starting up, context available shortly"
 
         if not res:
             return "[LSP] Language server starting up, context available shortly"
