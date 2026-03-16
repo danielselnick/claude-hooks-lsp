@@ -30,7 +30,7 @@ def _npm_global_install(pkg: str):
 
 def _pip_install(pkg: str):
     return lambda: subprocess.run(
-        [sys.executable, "-m", "pip", "install", pkg], check=True,
+        [sys.executable, "-m", "pip", "install", "--user", pkg], check=True,
     )
 
 def _cargo_install(pkg: str):
@@ -63,7 +63,7 @@ LSP_SERVERS = [
         "binary": "pylsp",
         "languages": "Python (.py .pyi)",
         "install": _pip_install("python-lsp-server"),
-        "install_hint": "pip install python-lsp-server",
+        "install_hint": "pip install --user python-lsp-server",
     },
     {
         "id": "csharp-ls",

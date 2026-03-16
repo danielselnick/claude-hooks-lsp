@@ -1,14 +1,16 @@
 {
   "name": "lsp-hooks-marketplace",
   "description": "Self-hosted marketplace for the lsp-hooks plugin",
-  "author": {
-    "name": "Daniel"
+  "owner": {
+    "name": "Daniel",
+    "email": "daniel@example.com"
   },
   "plugins": [
     {
       "name": "lsp-hooks",
       "description": "Proactive LSP context injection for Claude Code — symbols, diagnostics, and structural context via hooks + persistent daemon",
-      "source": "."
+      "category": "development",
+      "source": "./"
     }
   ]
 }
