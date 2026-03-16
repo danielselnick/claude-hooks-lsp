@@ -56,6 +56,34 @@ def _try_start_daemon():
         return False
 
 
+def _restart_daemon():
+    """Kill old daemon (if any) and start a fresh one."""
+    if os.path.exists(PID_PATH):
+        try:
+            with open(PID_PATH) as f:
+                old_pid = int(f.read().strip())
+            os.kill(old_pid, 15)  # SIGTERM
+        except (ProcessLookupError, ValueError, OSError):
+            pass
+        time.sleep(0.3)
+    # Clean up stale runtime files
+    for p in (PID_PATH, VERSION_PATH, SOCKET_PATH):
+        if os.path.exists(p):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+    _try_start_daemon()
+    time.sleep(0.5)
+
+
+def _get_current_version():
+    """Read version from plugin.json."""
+    plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(plugin_root, ".claude-plugin", "plugin.json")) as f:
+        return json.loads(f.read()).get("version", "")
+
+
 def main():
     t0 = time.monotonic()
     rid = uuid.uuid4().hex[:8]
@@ -123,24 +151,33 @@ def main():
                 log.debug("skipped: excluded path %s", excl)
                 return
 
-    # Check for version mismatch — restart daemon on upgrade
+    # File-based version check — restart daemon on upgrade
     try:
-        plugin_root = os.environ.get("CLAUDE_PLUGIN_ROOT", os.path.dirname(os.path.abspath(__file__)))
-        with open(os.path.join(plugin_root, ".claude-plugin", "plugin.json")) as f:
-            current_version = json.loads(f.read()).get("version", "")
+        current_version = _get_current_version()
         running_version = ""
         if os.path.exists(VERSION_PATH):
             with open(VERSION_PATH) as f:
                 running_version = f.read().strip()
+
+        need_restart = False
         if current_version and running_version and current_version != running_version:
-            log.info("version mismatch: running=%s current=%s — restarting daemon", running_version, current_version)
-            if os.path.exists(PID_PATH):
-                with open(PID_PATH) as f:
-                    old_pid = int(f.read().strip())
-                os.kill(old_pid, 15)  # SIGTERM
-                time.sleep(0.3)
-            _try_start_daemon()
-            time.sleep(0.5)
+            # Both exist and differ → version mismatch
+            log.info("version mismatch: running=%s current=%s — restarting daemon",
+                     running_version, current_version)
+            need_restart = True
+        elif current_version and not running_version and os.path.exists(PID_PATH):
+            # VERSION_PATH missing but PID exists — old daemon without version support
+            try:
+                pid_age = time.time() - os.path.getmtime(PID_PATH)
+            except OSError:
+                pid_age = 0
+            if pid_age > 5:
+                log.info("no version file but PID exists (age=%.0fs) — restarting old daemon",
+                         pid_age)
+                need_restart = True
+
+        if need_restart:
+            _restart_daemon()
     except Exception as e:
         log.debug("version check skipped: %s", e)
 
@@ -161,6 +198,54 @@ def main():
                     continue
             log.warning("daemon unreachable: %s (%.0fms)", e, (time.monotonic() - t0) * 1000)
             return  # daemon not running — graceful degradation
+
+    if sock is None:
+        return
+
+    # Socket-based version check (SessionStart only — catches stale daemon even
+    # when cached hook code previously lacked file-based version checks)
+    if event == "session-start":
+        try:
+            current_version = _get_current_version()
+            if current_version:
+                ver_req = json.dumps({"method": "version", "request_id": rid}) + "\n"
+                sock.sendall(ver_req.encode())
+                ver_buf = b""
+                sock.settimeout(2.0)
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    ver_buf += chunk
+                    if b"\n" in ver_buf:
+                        break
+                sock.settimeout(None)
+                if ver_buf:
+                    ver_resp = json.loads(ver_buf.decode().split("\n", 1)[0])
+                    daemon_version = ver_resp.get("version", "")
+                    if not daemon_version or daemon_version != current_version:
+                        log.info("socket version check: daemon=%s current=%s — restarting",
+                                 daemon_version or "(no version method)", current_version)
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+                        sock = None
+                        _restart_daemon()
+                        # Reconnect to new daemon
+                        try:
+                            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                            sock.settimeout(CONNECT_TIMEOUT)
+                            sock.connect(SOCKET_PATH)
+                            sock.settimeout(None)
+                        except (socket.error, OSError) as e:
+                            log.warning("reconnect after version restart failed: %s", e)
+                            return
+        except Exception as e:
+            log.debug("socket version check skipped: %s", e)
+            # If the socket died during version check, try to reconnect
+            if sock is None:
+                return
 
     if sock is None:
         return

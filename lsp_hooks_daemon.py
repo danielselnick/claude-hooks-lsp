@@ -37,6 +37,8 @@ def _rid() -> str:
 # Config
 # ---------------------------------------------------------------------------
 
+GATHER_TIMEOUT = 4.0  # seconds — max time to wait for parallel MCP calls
+
 DEFAULTS = {
     "lsp_mcp_server_path": "",
     "socket_path": SOCKET_PATH,
@@ -458,6 +460,26 @@ def _extract_list(data, *keys) -> list:
     return []
 
 
+async def _gather_partial(coros, timeout):
+    """Like asyncio.gather(return_exceptions=True) but returns partial results on timeout."""
+    tasks = [asyncio.ensure_future(c) for c in coros]
+    done, pending = await asyncio.wait(tasks, timeout=timeout)
+    for t in pending:
+        t.cancel()
+    # Suppress CancelledError from cancelled tasks
+    await asyncio.gather(*pending, return_exceptions=True)
+    results = []
+    for t in tasks:
+        if t in done:
+            try:
+                results.append(t.result())
+            except Exception:
+                results.append(None)
+        else:
+            results.append(None)
+    return results, len(pending)
+
+
 # ---------------------------------------------------------------------------
 # Daemon
 # ---------------------------------------------------------------------------
@@ -477,6 +499,7 @@ class LSPHooksDaemon:
         self.recent_reads: set[str] = set()
         self._server = None
         self._last_permission_mode = "default"
+        self._version = "unknown"
 
     # -- lifecycle --
 
@@ -484,20 +507,23 @@ class LSPHooksDaemon:
         pid_path = self.cfg["pid_path"]
         socket_path = self.cfg["socket_path"]
 
-        with open(pid_path, "w") as f:
-            f.write(str(os.getpid()))
-
-        # Write current version so the hook client can detect upgrades
+        # Read current version from plugin.json
         try:
             plugin_json = Path(__file__).resolve().parent / ".claude-plugin" / "plugin.json"
-            version = json.loads(plugin_json.read_text()).get("version", "unknown")
+            self._version = json.loads(plugin_json.read_text()).get("version", "unknown")
         except Exception:
-            version = "unknown"
+            self._version = "unknown"
+
+        # Write VERSION first (eliminates race where PID exists but VERSION doesn't)
         version_path = self.cfg.get("version_path", "")
         if version_path:
             with open(version_path, "w") as f:
-                f.write(version)
-            log.info("wrote version %s to %s", version, version_path)
+                f.write(self._version)
+            log.info("wrote version %s to %s", self._version, version_path)
+
+        # Write PID second
+        with open(pid_path, "w") as f:
+            f.write(str(os.getpid()))
 
         if os.path.exists(socket_path):
             os.unlink(socket_path)
@@ -577,6 +603,8 @@ class LSPHooksDaemon:
                      json.dumps(req.get("params", {}), default=str)[:500])
             if method == "ping":
                 resp = {"ok": True, "pong": True}
+            elif method == "version":
+                resp = {"ok": True, "version": self._version}
             elif method == "query":
                 resp = await self._dispatch(req.get("params", {}))
             else:
@@ -674,18 +702,16 @@ class LSPHooksDaemon:
 
     async def _h_pre_read(self, file_path: str, tool_input: dict, cwd: str) -> str:
         self.recent_reads.add(file_path)
-        syms_r, diag_r, exp_r = await asyncio.gather(
+        (syms_r, diag_r, exp_r), n_pending = await _gather_partial([
             self._tc_cached("lsp_document_symbols", {"file_path": file_path},
                             file_path=file_path),
             self._tc_cached("lsp_diagnostics", {"file_path": file_path, "severity_filter": "error"},
                             file_path=file_path),
             self._tc_cached("lsp_file_exports", {"file_path": file_path},
                             file_path=file_path),
-            return_exceptions=True,
-        )
-        syms_r = syms_r if not isinstance(syms_r, Exception) else None
-        diag_r = diag_r if not isinstance(diag_r, Exception) else None
-        exp_r = exp_r if not isinstance(exp_r, Exception) else None
+        ], timeout=GATHER_TIMEOUT)
+        if n_pending:
+            log.debug("[%s] pre-read: %d/3 MCP calls timed out", _rid(), n_pending)
 
         rel = _rel(file_path, cwd)
         lines: list[str] = [f"[LSP] Structure of {rel}:"]
@@ -779,9 +805,11 @@ class LSPHooksDaemon:
         tasks.append(self._tc_cached("lsp_file_exports", {"file_path": file_path},
                                      file_path=file_path))
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        smart = [r if not isinstance(r, Exception) else None for r in results[:len(relevant)]]
-        exp_data = results[len(relevant)] if not isinstance(results[len(relevant)], Exception) else None
+        results, n_pending = await _gather_partial(tasks, timeout=GATHER_TIMEOUT)
+        if n_pending:
+            log.debug("[%s] pre-write: %d/%d MCP calls timed out", _rid(), n_pending, len(tasks))
+        smart = results[:len(relevant)]
+        exp_data = results[len(relevant)] if len(results) > len(relevant) else None
 
         # Format
         rel_path = _rel(file_path, cwd)
@@ -862,11 +890,13 @@ class LSPHooksDaemon:
                                 file_path=fp)
                 for fp in self.recent_writes[-5:]
             ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            results, n_pending = await _gather_partial(tasks, timeout=GATHER_TIMEOUT)
+            if n_pending:
+                log.debug("[%s] pre-bash: %d/%d diagnostic calls timed out", _rid(), n_pending, len(tasks))
             lines = ["[LSP] Pre-build diagnostics:"]
             has = False
             for fp, res in zip(self.recent_writes[-5:], results):
-                if isinstance(res, Exception) or not res:
+                if not res:
                     continue
                 dl = _extract_list(res, "diagnostics")
                 if dl:
