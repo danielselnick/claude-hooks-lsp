@@ -1,0 +1,9 @@
+{
+  "name": "lsp-hooks",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Proactive LSP context injection for Claude Code",
+  "dependencies": {
+    "lsp-mcp-server": "^1.1.15"
+  }
+}
