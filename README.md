@@ -71,14 +71,17 @@ The daemon auto-starts on first hook invocation if not already running.
 |---|---|---|
 | Python | 3.9+ | `python3 --version` |
 | Node.js | 18+ | `node --version` |
+| uv | latest | `uv --version` |
 | Claude Code | latest | `claude --version` |
+
+Don't have uv? `curl -LsSf https://astral.sh/uv/install.sh | sh`
 
 At least one LSP server for your language(s):
 
 | Language | Server | Install |
 |---|---|---|
 | Rust | rust-analyzer | `cargo install rust-analyzer` |
-| Python | pylsp | `pip install python-lsp-server` |
+| Python | pylsp | `uv tool install python-lsp-server` |
 | TypeScript/JS | typescript-language-server | `npm install -g typescript-language-server` |
 | C# | csharp-ls | `dotnet tool install --global csharp-ls` |
 | C/C++ | clangd | Xcode CLI tools or `brew install llvm` |

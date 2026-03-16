@@ -28,9 +28,9 @@ def _npm_global_install(pkg: str):
         ["npm", "install", "-g", pkg], check=True,
     )
 
-def _pip_install(pkg: str):
+def _uv_tool_install(pkg: str):
     return lambda: subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--user", pkg], check=True,
+        ["uv", "tool", "install", pkg], check=True,
     )
 
 def _cargo_install(pkg: str):
@@ -62,8 +62,8 @@ LSP_SERVERS = [
         "id": "pylsp",
         "binary": "pylsp",
         "languages": "Python (.py .pyi)",
-        "install": _pip_install("python-lsp-server"),
-        "install_hint": "pip install --user python-lsp-server",
+        "install": _uv_tool_install("python-lsp-server"),
+        "install_hint": "uv tool install python-lsp-server",
     },
     {
         "id": "csharp-ls",
@@ -149,6 +149,13 @@ def check_prerequisites():
         print(f"  {_green('✓')} node: {node}")
     else:
         print(f"  {_red('✗')} node not found (required for lsp-mcp-server)")
+        ok = False
+
+    uv = shutil.which("uv")
+    if uv:
+        print(f"  {_green('✓')} uv: {uv}")
+    else:
+        print(f"  {_red('✗')} uv not found — install via: curl -LsSf https://astral.sh/uv/install.sh | sh")
         ok = False
 
     return ok
