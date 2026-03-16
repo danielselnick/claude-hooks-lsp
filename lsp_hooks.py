@@ -239,7 +239,18 @@ def main():
                             break
                 finally:
                     sock.settimeout(None)
-                if ver_buf:
+                if not ver_buf:
+                    # Socket closed without response — reconnect for the query
+                    log.debug("version check: empty response, reconnecting")
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sock.settimeout(CONNECT_TIMEOUT)
+                    sock.connect(SOCKET_PATH)
+                    sock.settimeout(None)
+                else:
                     ver_resp = json.loads(ver_buf.decode().split("\n", 1)[0])
                     daemon_version = ver_resp.get("version", "")
                     if not daemon_version or _parse_version(current_version) > _parse_version(daemon_version):
@@ -265,6 +276,17 @@ def main():
                                     continue
                                 log.warning("reconnect after version restart failed: %s", e)
                                 return
+                    else:
+                        # Version OK — but daemon closed this connection after responding.
+                        # Open a fresh socket for the query.
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
+                        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                        sock.settimeout(CONNECT_TIMEOUT)
+                        sock.connect(SOCKET_PATH)
+                        sock.settimeout(None)
         except Exception as e:
             log.debug("socket version check skipped: %s", e)
             # If the socket died during version check, try to reconnect
