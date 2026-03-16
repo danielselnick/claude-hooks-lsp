@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """LSP Hooks installer — sets up npm deps, LSP servers, and daemon."""
 
+from __future__ import annotations
+
 import json
 import os
 import platform
@@ -297,11 +299,26 @@ def cleanup_old_hooks():
         shutil.copy2(settings_path, backup)
         print(f"  Backup: {backup}")
 
-        del settings["hooks"]
+        # Surgically remove only lsp_hooks.py entries, preserve other hooks
+        for group_name in list(hooks.keys()):
+            entries = hooks[group_name]
+            filtered = []
+            for entry in entries:
+                entry_hooks = entry.get("hooks", [])
+                remaining = [h for h in entry_hooks if "lsp_hooks.py" not in h.get("command", "")]
+                if remaining:
+                    entry["hooks"] = remaining
+                    filtered.append(entry)
+            if filtered:
+                hooks[group_name] = filtered
+            else:
+                del hooks[group_name]
+        if not hooks:
+            del settings["hooks"]
         with open(settings_path, "w") as f:
             json.dump(settings, f, indent=2)
             f.write("\n")
-        print(f"  {_green('✓')} Removed hooks from settings.json")
+        print(f"  {_green('✓')} Removed lsp-hooks entries from settings.json")
     else:
         print(f"  {_yellow('!')} Skipped — old hooks left in place")
         print(f"  Note: duplicate hooks may fire if both plugin and settings.json hooks are active")

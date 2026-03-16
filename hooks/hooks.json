@@ -30,6 +30,26 @@
             "timeout": 1000
           }
         ]
+      },
+      {
+        "matcher": "Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event pre-grep",
+            "timeout": 2000
+          }
+        ]
+      },
+      {
+        "matcher": "Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event pre-glob",
+            "timeout": 2000
+          }
+        ]
       }
     ],
     "UserPromptSubmit": [

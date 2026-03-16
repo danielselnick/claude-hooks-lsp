@@ -105,18 +105,11 @@ Optional overrides in `~/.lsp-hooks/config.json`:
 
 ```json
 {
-  "budgets": {
-    "pre_read_ms": 1000,
-    "pre_write_ms": 2000,
-    "session_start_ms": 3000
-  },
   "limits": {
     "max_symbols_per_file": 5,
     "max_callers_shown": 3
   },
-  "filters": {
-    "excluded_paths": ["target/", ".git/", "node_modules/"]
-  }
+  "cache_ttl_seconds": 60
 }
 ```
 
@@ -152,7 +145,7 @@ claude /plugin list
 
 ```sh
 # Remove plugin
-claude /plugin marketplace remove claude-hooks-lsp
+claude /plugin marketplace remove lsp-hooks
 
 # Stop daemon
 kill $(cat /tmp/lsp-hooks-$(whoami).pid)

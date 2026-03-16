@@ -45,21 +45,10 @@ DEFAULTS = {
     "pid_path": PID_PATH,
     "version_path": VERSION_PATH,
     "limits": {
-        "max_symbols_per_file": 5,
-        "max_callers_shown": 3,
-        "max_references_shown": 3,
-        "max_related_files_shown": 5,
+        "max_symbols_per_file": 10000,
+        "max_callers_shown": 10000,
     },
-    "filters": {
-        "supported_extensions": [
-            ".rs", ".toml",
-            ".py", ".pyi",
-            ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
-            ".cs",
-        ],
-        "excluded_paths": ["target/", ".git/", "node_modules/"],
-    },
-    "cache_ttl_seconds": 30,
+    "cache_ttl_seconds": 60,
 }
 
 
@@ -205,7 +194,7 @@ class MCPClient:
     async def _call(self, method: str, params: dict):
         req_id = self._next_id
         self._next_id += 1
-        fut = asyncio.get_event_loop().create_future()
+        fut = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
         try:
             async with self._write_lock:
@@ -462,7 +451,7 @@ def _extract_list(data, *keys) -> list:
 
 async def _gather_partial(coros, timeout):
     """Like asyncio.gather(return_exceptions=True) but returns partial results on timeout."""
-    tasks = [asyncio.ensure_future(c) for c in coros]
+    tasks = [asyncio.create_task(c) for c in coros]
     done, pending = await asyncio.wait(tasks, timeout=timeout)
     for t in pending:
         t.cancel()
@@ -478,6 +467,58 @@ async def _gather_partial(coros, timeout):
         else:
             results.append(None)
     return results, len(pending)
+
+
+def _extract_symbol_candidates(pattern: str) -> list[str]:
+    """Extract likely symbol names from a grep regex pattern.
+
+    Returns up to 3 candidate identifiers suitable for lsp_find_symbol queries.
+    """
+    candidates: list[str] = []
+    seen: set[str] = set()
+
+    # 1. If whole pattern is a plain identifier, use it directly
+    if re.fullmatch(r'[A-Za-z_]\w{2,}', pattern):
+        return [pattern]
+
+    # 2. Split on | (regex alternation) and try each part
+    parts = re.split(r'(?<!\\)\|', pattern)
+    for part in parts:
+        # Strip common regex constructs: anchors, char classes, quantifiers, groups
+        clean = part.strip()
+        clean = re.sub(r'\\[bBdDwWsS]', '', clean)  # \b, \w, \d, etc.
+        clean = re.sub(r'[\^$]', '', clean)            # anchors
+        clean = re.sub(r'\.\*|\.\+|\.\?', '', clean)  # .*, .+, .?
+        clean = re.sub(r'\[.*?\]', '', clean)          # char classes
+        clean = re.sub(r'[(){}?+*]', '', clean)        # groups/quantifiers
+        clean = re.sub(r'\\(.)', r'\1', clean)         # unescape literals
+        clean = clean.strip()
+
+        # Must be a valid identifier of length >= 3
+        if re.fullmatch(r'[A-Za-z_]\w{2,}', clean) and clean not in seen:
+            seen.add(clean)
+            candidates.append(clean)
+
+    return candidates[:3]
+
+
+def _extract_symbol_from_glob(pattern: str) -> list[str]:
+    """Extract potential symbol names from a file glob pattern.
+
+    e.g. '**/UserService*.ts' -> ['UserService']
+         'src/handlers/**/*.rs' -> []  (no symbol name)
+    """
+    candidates = []
+    # Get the filename part (last path segment before extension)
+    basename = pattern.rsplit("/", 1)[-1] if "/" in pattern else pattern
+    # Remove extension
+    name_part = re.sub(r'\.\w+$', '', basename)
+    # Remove glob wildcards
+    name_part = re.sub(r'[*?\[\]]', '', name_part)
+    # Must be a valid identifier >= 3 chars
+    if re.fullmatch(r'[A-Za-z_]\w{2,}', name_part):
+        candidates.append(name_part)
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +539,7 @@ class LSPHooksDaemon:
         self.recent_writes: list[str] = []
         self.recent_reads: set[str] = set()
         self._server = None
+        self._active_handlers: set = set()
         self._last_permission_mode = "default"
         self._version = "unknown"
 
@@ -542,15 +584,23 @@ class LSPHooksDaemon:
         if self._server:
             self._server.close()
             await self._server.wait_closed()
+        if self._active_handlers:
+            log.info("draining %d active handler(s)…", len(self._active_handlers))
+            _done, pending = await asyncio.wait(self._active_handlers, timeout=2.0)
+            if pending:
+                log.warning("drain timeout: %d handler(s) still active", len(pending))
         await self.mcp.stop()
         self.sqlite_cache.close()
         for p in (self.cfg["socket_path"], self.cfg["pid_path"], self.cfg.get("version_path", "")):
-            if os.path.exists(p):
-                os.unlink(p)
+            if p and os.path.exists(p):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
 
     async def run(self):
         await self.start()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         stop = asyncio.Event()
 
         def _sig():
@@ -585,12 +635,15 @@ class LSPHooksDaemon:
         await stop.wait()
         wd.cancel()
         ev.cancel()
+        await asyncio.gather(wd, ev, return_exceptions=True)
         await self.cleanup()
         print("[lsp-hooks] stopped", file=sys.stderr)
 
     # -- socket handler --
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        task = asyncio.current_task()
+        self._active_handlers.add(task)
         t0 = time.monotonic()
         try:
             data = await reader.readline()
@@ -627,6 +680,7 @@ class LSPHooksDaemon:
             except Exception:
                 pass
         finally:
+            self._active_handlers.discard(task)
             writer.close()
             try:
                 await writer.wait_closed()
@@ -650,7 +704,15 @@ class LSPHooksDaemon:
             except Exception as e:
                 return {"ok": False, "error": f"MCP restart failed: {e}"}
 
-        cache_key = f"{event}:{file_path}"
+        # Include content hash when file_path is empty to avoid key collisions
+        if file_path:
+            cache_key = f"{event}:{file_path}"
+        else:
+            import hashlib
+            content_hash = hashlib.md5(
+                json.dumps(tool_input, sort_keys=True, default=str).encode()
+            ).hexdigest()[:12]
+            cache_key = f"{event}::{content_hash}"
         cached = self.cache.get(cache_key)
         if cached is not None:
             log.info("[%s] L1 cache HIT for %s", _rid(), cache_key)
@@ -660,6 +722,8 @@ class LSPHooksDaemon:
             "pre-read": self._h_pre_read,
             "pre-write": self._h_pre_write,
             "pre-bash": self._h_pre_bash,
+            "pre-grep": self._h_pre_grep,
+            "pre-glob": self._h_pre_glob,
             "prompt": self._h_prompt,
             "session-start": self._h_session_start,
         }
@@ -702,6 +766,9 @@ class LSPHooksDaemon:
 
     async def _h_pre_read(self, file_path: str, tool_input: dict, cwd: str) -> str:
         self.recent_reads.add(file_path)
+        if len(self.recent_reads) > 50:
+            # Discard arbitrary element to cap size
+            self.recent_reads.pop()
         (syms_r, diag_r, exp_r), n_pending = await _gather_partial([
             self._tc_cached("lsp_document_symbols", {"file_path": file_path},
                             file_path=file_path),
@@ -926,6 +993,134 @@ class LSPHooksDaemon:
                 ln = item.get("line", "?")
                 lines.append(f"  {_rel(fp, cwd)}:{ln}: {msg}")
         return "\n".join(lines) if len(lines) > 1 else ""
+
+    async def _h_pre_grep(self, file_path: str, tool_input: dict, cwd: str) -> str:
+        pattern = tool_input.get("pattern", "")
+        if not pattern:
+            return ""
+
+        candidates = _extract_symbol_candidates(pattern)
+        if not candidates:
+            return ""
+
+        lines = [f"[LSP] Symbol context for search `{pattern}`:"]
+
+        for name in candidates[:2]:  # limit to 2 to stay within timeout
+            try:
+                res = await self._tc_cached("lsp_find_symbol", {
+                    "name": name,
+                    "include": ["references", "incoming_calls", "outgoing_calls"],
+                    "references_limit": 5,
+                }, file_path=None)
+
+                if not res or not isinstance(res, dict):
+                    continue
+
+                match = res.get("match", {})
+                if not match:
+                    continue
+
+                sym_name = match.get("name", name)
+                path = match.get("path", "")
+                ln = match.get("line", "?")
+                kind = match.get("kind", "")
+                hover = match.get("hover", "")
+
+                lines.append(f"  `{sym_name}` ({kind}, {_rel(path, cwd)}:{ln})")
+                if hover:
+                    sig = hover.split("\n")[0][:120]
+                    lines.append(f"    {sig}")
+
+                refs = (res.get("references") or {})
+                total = refs.get("total_count", 0)
+                if total:
+                    lines.append(f"    {total} references")
+
+                ic = res.get("incoming_calls", [])
+                if ic:
+                    callers = _fmt_callers(ic, 3)
+                    if callers:
+                        lines.append(f"    Called by: {callers}")
+
+                oc = res.get("outgoing_calls", [])
+                if oc:
+                    callees = ", ".join(f"`{c.get('name', '?')}`" for c in oc[:3])
+                    if callees:
+                        lines.append(f"    Calls: {callees}")
+            except Exception:
+                continue
+
+        return "\n".join(lines) if len(lines) > 1 else ""
+
+    async def _h_pre_glob(self, file_path: str, tool_input: dict, cwd: str) -> str:
+        pattern = tool_input.get("pattern", "")
+        search_path = file_path or cwd
+
+        # Strategy 1: Extract symbol names from glob pattern
+        candidates = _extract_symbol_from_glob(pattern)
+        if candidates:
+            lines = [f"[LSP] Symbol context for glob `{pattern}`:"]
+            for name in candidates[:2]:
+                try:
+                    res = await self._tc_cached("lsp_find_symbol", {
+                        "name": name,
+                        "include": ["references", "incoming_calls"],
+                        "references_limit": 5,
+                    }, file_path=None)
+
+                    if not res or not isinstance(res, dict):
+                        continue
+                    match = res.get("match", {})
+                    if not match:
+                        continue
+
+                    sym_name = match.get("name", name)
+                    path = match.get("path", "")
+                    ln = match.get("line", "?")
+                    kind = match.get("kind", "")
+                    lines.append(f"  `{sym_name}` ({kind}, {_rel(path, cwd)}:{ln})")
+
+                    refs = (res.get("references") or {})
+                    total = refs.get("total_count", 0)
+                    if total:
+                        lines.append(f"    {total} references")
+
+                    ic = res.get("incoming_calls", [])
+                    if ic:
+                        callers = _fmt_callers(ic, 3)
+                        if callers:
+                            lines.append(f"    Called by: {callers}")
+                except Exception:
+                    continue
+
+            if len(lines) > 1:
+                return "\n".join(lines)
+
+        # Strategy 2: If path is a specific subdirectory, show workspace symbols
+        # Skip if path is the project root (too broad, session-start already covers this)
+        if search_path and search_path != cwd and os.path.isdir(search_path):
+            rel_dir = _rel(search_path, cwd)
+            try:
+                res = await self._tc_cached("lsp_workspace_symbols",
+                                             {"query": os.path.basename(search_path), "limit": 10},
+                                             file_path=None)
+                if res:
+                    syms = _extract_symbols(res)
+                    # Filter to symbols actually in the search directory
+                    in_dir = [s for s in syms
+                              if s.get("path", "").startswith(search_path)]
+                    if in_dir:
+                        lines = [f"[LSP] Symbols in {rel_dir}/:"]
+                        for s in in_dir[:8]:
+                            name = s.get("name", "?")
+                            kind = s.get("kind", "?")
+                            ln = s.get("line", "?")
+                            lines.append(f"  `{name}` ({kind}, L{ln})")
+                        return "\n".join(lines)
+            except Exception:
+                pass
+
+        return ""
 
     async def _h_prompt(self, _file_path: str, tool_input: dict, cwd: str) -> str:
         prompt = tool_input.get("user_prompt", "")

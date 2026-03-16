@@ -1,6 +1,6 @@
 {
   "name": "lsp-hooks",
-  "version": "1.7.0",
+  "version": "1.10.0",
   "description": "Proactive LSP context injection for Claude Code — automatically provides symbol info, diagnostics, and structural context via hooks + a persistent daemon",
   "author": {
     "name": "Daniel",

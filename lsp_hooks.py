@@ -29,6 +29,8 @@ SUPPORTED_EXTENSIONS = frozenset((
     ".py", ".pyi",
     ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
     ".cs",
+    ".go",
+    ".c", ".cpp", ".h", ".hpp",
 ))
 EXCLUDED_PATHS = ("target/", ".git/", "node_modules/")
 
@@ -40,7 +42,7 @@ def _try_start_daemon():
     if not os.path.exists(daemon_script):
         log.warning("daemon script not found: %s", daemon_script)
         return False
-    env = dict(os.environ, CLAUDE_PLUGIN_ROOT=plugin_root)
+    env = dict(os.environ, CLAUDE_PLUGIN_ROOT=plugin_root, LSP_HOOKS_ACTIVE="1")
     try:
         subprocess.Popen(
             [sys.executable, daemon_script],
@@ -75,6 +77,14 @@ def _restart_daemon():
                 pass
     _try_start_daemon()
     time.sleep(0.5)
+
+
+def _parse_version(v: str) -> tuple:
+    """Parse semver string into comparable integer tuple."""
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except (ValueError, AttributeError):
+        return (0,)
 
 
 def _get_current_version():
@@ -114,7 +124,7 @@ def main():
     except (json.JSONDecodeError, IOError) as e:
         log.error("stdin parse error: %s", e)
         print("lsp-hooks: stdin parse error", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(0)
 
     log.info("[%s] >>> event=%s tool=%s file=%s",
              rid, event,
@@ -130,6 +140,9 @@ def main():
     file_path = ""
     if event in ("pre-write", "pre-read"):
         file_path = tool_input.get("file_path", "")
+    elif event in ("pre-grep", "pre-glob"):
+        # Search scope directory (not a source file — skip extension filter)
+        file_path = tool_input.get("path", "")
     elif event == "prompt":
         # Pass user_prompt through tool_input for daemon
         # Field is "prompt" in actual stdin (not "user_prompt" as SKILL.md claims)
@@ -140,15 +153,15 @@ def main():
     if file_path and not os.path.isabs(file_path):
         file_path = os.path.join(cwd, file_path)
 
-    # Extension filter
-    if file_path:
+    # Extension filter (only for file-specific events)
+    if file_path and event in ("pre-write", "pre-read"):
         _, ext = os.path.splitext(file_path)
         if ext not in SUPPORTED_EXTENSIONS:
-            log.debug("skipped: unsupported extension %s", ext)
+            log.info("skipped: unsupported extension %s", ext)
             return
         for excl in EXCLUDED_PATHS:
             if excl in file_path:
-                log.debug("skipped: excluded path %s", excl)
+                log.info("skipped: excluded path %s", excl)
                 return
 
     # File-based version check — restart daemon on upgrade
@@ -160,11 +173,15 @@ def main():
                 running_version = f.read().strip()
 
         need_restart = False
-        if current_version and running_version and current_version != running_version:
-            # Both exist and differ → version mismatch
-            log.info("version mismatch: running=%s current=%s — restarting daemon",
+        if current_version and running_version and _parse_version(current_version) > _parse_version(running_version):
+            # Current plugin is newer → version upgrade
+            log.info("version upgrade: running=%s current=%s — restarting daemon",
                      running_version, current_version)
             need_restart = True
+        elif current_version and running_version and _parse_version(running_version) > _parse_version(current_version):
+            log.info("daemon is newer: running=%s > current=%s — keeping existing",
+                     running_version, current_version)
+
         elif current_version and not running_version and os.path.exists(PID_PATH):
             # VERSION_PATH missing but PID exists — old daemon without version support
             try:
@@ -211,20 +228,22 @@ def main():
                 ver_req = json.dumps({"method": "version", "request_id": rid}) + "\n"
                 sock.sendall(ver_req.encode())
                 ver_buf = b""
-                sock.settimeout(2.0)
-                while True:
-                    chunk = sock.recv(4096)
-                    if not chunk:
-                        break
-                    ver_buf += chunk
-                    if b"\n" in ver_buf:
-                        break
-                sock.settimeout(None)
+                try:
+                    sock.settimeout(2.0)
+                    while True:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        ver_buf += chunk
+                        if b"\n" in ver_buf:
+                            break
+                finally:
+                    sock.settimeout(None)
                 if ver_buf:
                     ver_resp = json.loads(ver_buf.decode().split("\n", 1)[0])
                     daemon_version = ver_resp.get("version", "")
-                    if not daemon_version or daemon_version != current_version:
-                        log.info("socket version check: daemon=%s current=%s — restarting",
+                    if not daemon_version or _parse_version(current_version) > _parse_version(daemon_version):
+                        log.info("socket version check: daemon=%s current=%s — upgrading",
                                  daemon_version or "(no version method)", current_version)
                         try:
                             sock.close()
@@ -232,15 +251,20 @@ def main():
                             pass
                         sock = None
                         _restart_daemon()
-                        # Reconnect to new daemon
-                        try:
-                            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                            sock.settimeout(CONNECT_TIMEOUT)
-                            sock.connect(SOCKET_PATH)
-                            sock.settimeout(None)
-                        except (socket.error, OSError) as e:
-                            log.warning("reconnect after version restart failed: %s", e)
-                            return
+                        # Reconnect to new daemon (retry — cold start may be slow)
+                        for retry in range(3):
+                            try:
+                                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                                sock.settimeout(CONNECT_TIMEOUT)
+                                sock.connect(SOCKET_PATH)
+                                sock.settimeout(None)
+                                break
+                            except (socket.error, OSError) as e:
+                                if retry < 2:
+                                    time.sleep(0.3)
+                                    continue
+                                log.warning("reconnect after version restart failed: %s", e)
+                                return
         except Exception as e:
             log.debug("socket version check skipped: %s", e)
             # If the socket died during version check, try to reconnect

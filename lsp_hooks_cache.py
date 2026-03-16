@@ -152,7 +152,7 @@ class SQLiteCache:
             return
         try:
             result_json = json.dumps(result, default=str)
-            if not result_json or result_json in ("null", '""', "[]", "{}"):
+            if not result_json or result_json in ("null", '""'):
                 return
         except (TypeError, ValueError):
             return
@@ -162,10 +162,14 @@ class SQLiteCache:
             mtime = _file_mtime_ns(file_path) if file_path else None
             now = time.time()
             conn.execute(
-                "INSERT OR REPLACE INTO tool_cache "
+                "INSERT INTO tool_cache "
                 "(tool_name, args_hash, file_path, file_mtime_ns, result_json, "
                 "created_at, last_hit_at, hit_count) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 0) "
+                "ON CONFLICT(tool_name, args_hash) DO UPDATE SET "
+                "file_mtime_ns=excluded.file_mtime_ns, "
+                "result_json=excluded.result_json, "
+                "last_hit_at=excluded.last_hit_at",
                 (tool_name, ah, file_path, mtime, result_json, now, now),
             )
             conn.commit()
