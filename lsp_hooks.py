@@ -15,9 +15,11 @@ import uuid
 
 from lsp_hooks_paths import LOG_PATH, SOCKET_PATH, PID_PATH, VERSION_PATH
 
+VERBOSE = os.environ.get("LSP_HOOKS_VERBOSE", "") == "1"
+
 logging.basicConfig(
     filename=LOG_PATH,
-    level=logging.DEBUG,
+    level=logging.DEBUG if VERBOSE else logging.INFO,
     format="%(asctime)s [hook] %(levelname)s %(message)s",
     datefmt="%H:%M:%S",
 )
@@ -126,10 +128,10 @@ def main():
         print("lsp-hooks: stdin parse error", file=sys.stderr)
         sys.exit(0)
 
-    log.info("[%s] >>> event=%s tool=%s file=%s",
-             rid, event,
-             hook_input.get("tool_name", "-"),
-             hook_input.get("tool_input", {}).get("file_path", "-"))
+    log.debug("[%s] >>> event=%s tool=%s file=%s",
+              rid, event,
+              hook_input.get("tool_name", "-"),
+              hook_input.get("tool_input", {}).get("file_path", "-"))
     log.debug("[%s] >>> stdin: %s", rid, json.dumps(hook_input, default=str)[:2000])
 
     cwd = hook_input.get("cwd", "")
@@ -157,11 +159,11 @@ def main():
     if file_path and event in ("pre-write", "pre-read"):
         _, ext = os.path.splitext(file_path)
         if ext not in SUPPORTED_EXTENSIONS:
-            log.info("skipped: unsupported extension %s", ext)
+            log.debug("skipped: unsupported extension %s", ext)
             return
         for excl in EXCLUDED_PATHS:
             if excl in file_path:
-                log.info("skipped: excluded path %s", excl)
+                log.debug("skipped: excluded path %s", excl)
                 return
 
     # File-based version check — restart daemon on upgrade
@@ -341,7 +343,7 @@ def main():
 
     context = response.get("context", "")
     if not context:
-        log.info("[%s] <<< empty context (%.0fms)", rid, elapsed_ms)
+        log.debug("[%s] <<< empty context (%.0fms)", rid, elapsed_ms)
         return
 
     # Emit hook output — systemMessage injects context for Claude

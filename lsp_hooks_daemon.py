@@ -20,11 +20,13 @@ from lsp_hooks_cache import SQLiteCache
 
 logging.basicConfig(
     filename=LOG_PATH,
-    level=logging.DEBUG,
+    level=logging.DEBUG if os.environ.get("LSP_HOOKS_VERBOSE", "") == "1" else logging.INFO,
     format="%(asctime)s [daemon] %(levelname)s %(message)s",
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("lsp_hooks_daemon")
+
+VERBOSE = os.environ.get("LSP_HOOKS_VERBOSE", "") == "1"
 
 _request_id: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="--------")
 
@@ -210,7 +212,7 @@ class MCPClient:
 
     async def tools_call(self, tool_name: str, arguments: dict):
         t0 = time.monotonic()
-        log.debug("[%s] MCP >>> %s(%s)", _rid(), tool_name, json.dumps(arguments, default=str)[:500])
+        log.info("[%s] MCP >>> %s(%s)", _rid(), tool_name, json.dumps(arguments, default=str)[:500])
         resp = await self._call("tools/call", {
             "name": tool_name, "arguments": arguments,
         })
@@ -222,12 +224,12 @@ class MCPClient:
         content = resp.get("result", {}).get("content", [])
         if content and content[0].get("type") == "text":
             raw_text = content[0].get("text", "")
-            log.debug("[%s] MCP <<< %s OK (%.0fms, %d chars)", _rid(), tool_name, elapsed, len(raw_text))
+            log.info("[%s] MCP <<< %s OK (%.0fms, %d chars)", _rid(), tool_name, elapsed, len(raw_text))
             try:
                 return json.loads(raw_text)
             except (json.JSONDecodeError, KeyError):
                 return raw_text
-        log.debug("[%s] MCP <<< %s OK (%.0fms, no text content)", _rid(), tool_name, elapsed)
+        log.info("[%s] MCP <<< %s OK (%.0fms, no text content)", _rid(), tool_name, elapsed)
         return resp.get("result")
 
     def is_alive(self) -> bool:
@@ -679,8 +681,8 @@ class LSPHooksDaemon:
             req = json.loads(data.decode().strip())
             _request_id.set(req.get("request_id", uuid.uuid4().hex[:8]))
             method = req.get("method")
-            log.info("[%s] socket >>> method=%s params=%s", _rid(), method,
-                     json.dumps(req.get("params", {}), default=str)[:500])
+            log.debug("[%s] socket >>> method=%s params=%s", _rid(), method,
+                      json.dumps(req.get("params", {}), default=str)[:500])
             if method == "ping":
                 resp = {"ok": True, "pong": True}
             elif method == "version":
@@ -691,9 +693,9 @@ class LSPHooksDaemon:
                 resp = {"ok": False, "error": f"unknown method: {method}"}
             elapsed = (time.monotonic() - t0) * 1000
             ctx_len = len(resp.get("context", ""))
-            log.info("[%s] socket <<< ok=%s context=%d chars (%.0fms): %s",
-                     _rid(), resp.get("ok"), ctx_len, elapsed,
-                     resp.get("context", resp.get("error", ""))[:300])
+            log.debug("[%s] socket <<< ok=%s context=%d chars (%.0fms): %s",
+                      _rid(), resp.get("ok"), ctx_len, elapsed,
+                      resp.get("context", resp.get("error", ""))[:300])
             writer.write((json.dumps(resp) + "\n").encode())
             await writer.drain()
         except ConnectionResetError:
@@ -748,7 +750,7 @@ class LSPHooksDaemon:
             cache_key = f"{event}::{content_hash}"
         cached = self.cache.get(cache_key)
         if cached is not None:
-            log.info("[%s] L1 cache HIT for %s", _rid(), cache_key)
+            log.debug("[%s] L1 cache HIT for %s", _rid(), cache_key)
             return {"ok": True, "context": cached}
 
         handlers = {
