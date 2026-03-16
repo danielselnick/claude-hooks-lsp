@@ -468,6 +468,66 @@ def _fmt_exports(exp_data, limit: int = 8) -> str | None:
     return f"Exports: {', '.join(names)}"
 
 
+def _fmt_imports(import_data, limit: int = 6) -> str | None:
+    """Format file imports as a compact one-liner."""
+    if not import_data:
+        return None
+    imp_list = _extract_list(import_data, "imports")
+    if not imp_list:
+        return None
+    names = []
+    for imp in imp_list:
+        if isinstance(imp, dict):
+            names.append(imp.get("module", imp.get("name", str(imp))))
+        else:
+            names.append(str(imp))
+    if not names:
+        return None
+    if len(names) <= limit:
+        return f"Imports: {', '.join(f'`{n}`' for n in names)}"
+    shown = ', '.join(f'`{n}`' for n in names[:limit])
+    return f"Imports: {shown} ({len(names)} total)"
+
+
+def _fmt_related_files(related_data, cwd: str, limit: int = 5) -> str | None:
+    """Format related files (imported_by) as a compact one-liner."""
+    if not related_data or not isinstance(related_data, dict):
+        return None
+    imported_by = related_data.get("imported_by", [])
+    if not imported_by:
+        return None
+    names = []
+    for f in imported_by[:limit]:
+        if isinstance(f, dict):
+            fp = f.get("path", f.get("file", ""))
+        else:
+            fp = str(f)
+        if fp:
+            names.append(os.path.basename(_rel(fp, cwd)))
+    if not names:
+        return None
+    suffix = f" ({len(imported_by)} files)" if len(imported_by) > limit else ""
+    return f"Imported by: {', '.join(f'`{n}`' for n in names)}{suffix}"
+
+
+def _fmt_type_hierarchy(hierarchy_data, limit: int = 4) -> str | None:
+    """Format type hierarchy (supertypes + subtypes) as a compact line."""
+    if not hierarchy_data or not isinstance(hierarchy_data, dict):
+        return None
+    parts = []
+    supertypes = hierarchy_data.get("supertypes", [])
+    if supertypes:
+        names = [f"`{s.get('name', '?')}`" if isinstance(s, dict) else f"`{s}`"
+                 for s in supertypes[:limit]]
+        parts.append(f"Supertypes: {', '.join(names)}")
+    subtypes = hierarchy_data.get("subtypes", [])
+    if subtypes:
+        names = [f"`{s.get('name', '?')}`" if isinstance(s, dict) else f"`{s}`"
+                 for s in subtypes[:limit]]
+        parts.append(f"Subtypes: {', '.join(names)}")
+    return "; ".join(parts) if parts else None
+
+
 def _extract_list(data, *keys) -> list:
     if isinstance(data, list):
         return data
@@ -817,16 +877,18 @@ class LSPHooksDaemon:
             lsp_start = None
             lsp_end = None
 
-        (syms_r, diag_r, exp_r), n_pending = await _gather_partial([
+        (syms_r, diag_r, exp_r, imp_r), n_pending = await _gather_partial([
             self._tc_cached("lsp_document_symbols", {"file_path": file_path},
                             file_path=file_path),
             self._tc_cached("lsp_diagnostics", {"file_path": file_path, "severity_filter": "error"},
                             file_path=file_path),
             self._tc_cached("lsp_file_exports", {"file_path": file_path},
                             file_path=file_path),
+            self._tc_cached("lsp_file_imports", {"file_path": file_path},
+                            file_path=file_path),
         ], timeout=GATHER_TIMEOUT)
         if n_pending:
-            log.debug("[%s] pre-read: %d/3 MCP calls timed out", _rid(), n_pending)
+            log.debug("[%s] pre-read: %d/4 MCP calls timed out", _rid(), n_pending)
 
         rel = _rel(file_path, cwd)
         range_suffix = f" (L{offset}-{offset + limit - 1})" if offset is not None and limit is not None else ""
@@ -849,6 +911,46 @@ class LSPHooksDaemon:
         exp_line = _fmt_exports(exp_r)
         if exp_line:
             lines.append(exp_line)
+
+        imp_line = _fmt_imports(imp_r)
+        if imp_line:
+            lines.append(imp_line)
+
+        # Batch 2: hover for top visible symbols (skip if batch 1 was slow)
+        if syms_r and n_pending == 0:
+            visible = _extract_symbols(syms_r)
+            if lsp_start is not None:
+                visible = _filter_symbols_by_range(
+                    visible, lsp_start,
+                    lsp_end if lsp_end is not None else float("inf"),
+                )
+            flat = _flatten_symbols(visible) if visible else []
+            hover_syms = [s for s in flat
+                          if s.get("kind") in ("Function", "Method", "Struct", "Class",
+                                                "Trait", "Interface", "Enum")][:2]
+            if hover_syms:
+                hover_tasks = []
+                for sym in hover_syms:
+                    sel = sym.get("selection_range", sym.get("range", {}))
+                    ln = max(sel.get("start", {}).get("line", sym.get("line", 1)), 1)
+                    col = max(sel.get("start", {}).get("column", sym.get("column", 1)), 1)
+                    hover_tasks.append(self._tc_cached("lsp_hover", {
+                        "file_path": file_path, "line": ln, "column": col,
+                    }, file_path=file_path))
+                hover_results, _ = await _gather_partial(hover_tasks, timeout=1.5)
+                hover_lines = []
+                for sym, hr in zip(hover_syms, hover_results):
+                    if hr and isinstance(hr, dict):
+                        contents = hr.get("contents", "")
+                        if contents:
+                            for hl in contents.split("\n"):
+                                hl = hl.strip()
+                                if hl and not hl.startswith("---") and not hl.startswith("```"):
+                                    hover_lines.append(f"  `{sym.get('name', '?')}` — `{hl[:120]}`")
+                                    break
+                if hover_lines:
+                    lines.append("Hover:")
+                    lines.extend(hover_lines)
 
         if diag_r:
             diag_list = _extract_list(diag_r, "diagnostics")
@@ -934,12 +1036,31 @@ class LSPHooksDaemon:
             }, file_path=file_path))
         tasks.append(self._tc_cached("lsp_file_exports", {"file_path": file_path},
                                      file_path=file_path))
+        tasks.append(self._tc_cached("lsp_file_imports", {"file_path": file_path},
+                                     file_path=file_path))
+        tasks.append(self._tc_cached("lsp_related_files",
+                                     {"file_path": file_path, "relationship": "imported_by"},
+                                     file_path=file_path))
+        # Type hierarchy for class-like symbols
+        class_like_kinds = ("Class", "Struct", "Trait", "Interface", "Enum")
+        hier_syms = [s for s in relevant if s.get("kind") in class_like_kinds][:2]
+        for sym in hier_syms:
+            sel = sym.get("selection_range", sym.get("range", {}))
+            ln = max(sel.get("start", {}).get("line", sym.get("line", 1)), 1)
+            col = max(sel.get("start", {}).get("column", sym.get("column", 1)), 1)
+            tasks.append(self._tc_cached("lsp_type_hierarchy", {
+                "file_path": file_path, "line": ln, "column": col, "direction": "both",
+            }, file_path=file_path))
 
         results, n_pending = await _gather_partial(tasks, timeout=GATHER_TIMEOUT)
         if n_pending:
             log.debug("[%s] pre-write: %d/%d MCP calls timed out", _rid(), n_pending, len(tasks))
-        smart = results[:len(relevant)]
-        exp_data = results[len(relevant)] if len(results) > len(relevant) else None
+        n_rel = len(relevant)
+        smart = results[:n_rel]
+        exp_data = results[n_rel] if len(results) > n_rel else None
+        imp_data = results[n_rel + 1] if len(results) > n_rel + 1 else None
+        rel_files_data = results[n_rel + 2] if len(results) > n_rel + 2 else None
+        hier_results = results[n_rel + 3:n_rel + 3 + len(hier_syms)]
 
         # Format
         rel_path = _rel(file_path, cwd)
@@ -1007,6 +1128,20 @@ class LSPHooksDaemon:
                         names.append(f"`{exp}`")
                 lines.append(f"Exports: {', '.join(names)}")
 
+        # Type hierarchy for class-like symbols
+        for sym, hr in zip(hier_syms, hier_results):
+            th_line = _fmt_type_hierarchy(hr)
+            if th_line:
+                lines.append(f"  {th_line}")
+
+        imp_line = _fmt_imports(imp_data)
+        if imp_line:
+            lines.append(imp_line)
+
+        rel_line = _fmt_related_files(rel_files_data, cwd)
+        if rel_line:
+            lines.append(rel_line)
+
         return "\n".join(lines) if len(lines) > 1 else ""
 
     async def _h_pre_bash(self, _file_path: str, tool_input: dict, cwd: str) -> str:
@@ -1015,17 +1150,24 @@ class LSPHooksDaemon:
             return ""
 
         if self.recent_writes:
+            recent = self.recent_writes[-5:]
             tasks = [
                 self._tc_cached("lsp_diagnostics", {"file_path": fp, "severity_filter": "error"},
                                 file_path=fp)
-                for fp in self.recent_writes[-5:]
+                for fp in recent
             ]
+            # Also get workspace-wide diagnostics
+            tasks.append(self._tc_cached("lsp_workspace_diagnostics", {
+                "severity_filter": "error", "limit": 5, "group_by": "file",
+            }, file_path=None))
             results, n_pending = await _gather_partial(tasks, timeout=GATHER_TIMEOUT)
             if n_pending:
                 log.debug("[%s] pre-bash: %d/%d diagnostic calls timed out", _rid(), n_pending, len(tasks))
+            per_file_results = results[:len(recent)]
+            ws_diag = results[len(recent)] if len(results) > len(recent) else None
             lines = ["[LSP] Pre-build diagnostics:"]
             has = False
-            for fp, res in zip(self.recent_writes[-5:], results):
+            for fp, res in zip(recent, per_file_results):
                 if not res:
                     continue
                 dl = _extract_list(res, "diagnostics")
@@ -1037,6 +1179,20 @@ class LSPHooksDaemon:
                             msg = d.get("message", str(d))[:80]
                             ln = d.get("range", {}).get("start", {}).get("line", d.get("line", "?"))
                             lines.append(f"  {r}:{ln}: {msg}")
+            # Cross-file workspace diagnostics
+            if ws_diag:
+                ws_items = _extract_list(ws_diag, "diagnostics", "items")
+                shown_files = set(recent)
+                cross = [i for i in ws_items if isinstance(i, dict) and
+                         i.get("file", i.get("path", "")) not in shown_files]
+                if cross:
+                    lines.append("Cross-file errors:")
+                    for item in cross[:5]:
+                        fp = item.get("file", item.get("path", ""))
+                        msg = item.get("message", str(item))[:80]
+                        ln = item.get("line", "?")
+                        lines.append(f"  {_rel(fp, cwd)}:{ln}: {msg}")
+                    has = True
             return "\n".join(lines) if has else ""
 
         # No recent writes — try workspace diagnostics
@@ -1110,6 +1266,18 @@ class LSPHooksDaemon:
                     callees = ", ".join(f"`{c.get('name', '?')}`" for c in oc[:3])
                     if callees:
                         lines.append(f"    Calls: {callees}")
+
+                # Type hierarchy for class-like symbols
+                if kind in ("Class", "Struct", "Trait", "Interface", "Enum") and path:
+                    th_data = await self._tc_cached("lsp_type_hierarchy", {
+                        "file_path": path,
+                        "line": max(ln if isinstance(ln, int) else 1, 1),
+                        "column": max(match.get("column", 1), 1),
+                        "direction": "both",
+                    }, file_path=path)
+                    th_line = _fmt_type_hierarchy(th_data)
+                    if th_line:
+                        lines.append(f"    {th_line}")
             except Exception:
                 continue
 
@@ -1153,6 +1321,15 @@ class LSPHooksDaemon:
                         callers = _fmt_callers(ic, 3)
                         if callers:
                             lines.append(f"    Called by: {callers}")
+
+                    # Related files (import graph neighborhood)
+                    if path:
+                        rel_data = await self._tc_cached("lsp_related_files", {
+                            "file_path": path, "relationship": "imported_by",
+                        }, file_path=path)
+                        rel_line = _fmt_related_files(rel_data, cwd)
+                        if rel_line:
+                            lines.append(f"    {rel_line}")
                 except Exception:
                     continue
 
@@ -1202,7 +1379,7 @@ class LSPHooksDaemon:
                 seen.add(abs_fp)
                 entities.append(("file", abs_fp))
         # Symbol names
-        sym_pats = re.findall(r"(?:fn|struct|trait|impl|enum|mod)\s+(\w+)", prompt)
+        sym_pats = re.findall(r"(?:fn|struct|trait|impl|enum|mod|def|class|func|type|interface|protocol)\s+(\w+)", prompt)
         pascal = re.findall(r"\b([A-Z][a-z]+(?:[A-Z][a-z]+)+)\b", prompt)
         for n in sym_pats + pascal:
             if n not in seen:
@@ -1216,13 +1393,20 @@ class LSPHooksDaemon:
         for etype, val in entities[:3]:
             try:
                 if etype == "file":
-                    res = await self._tc_cached("lsp_document_symbols", {"file_path": val},
-                                                file_path=val)
+                    (res, imp_data), _ = await _gather_partial([
+                        self._tc_cached("lsp_document_symbols", {"file_path": val},
+                                        file_path=val),
+                        self._tc_cached("lsp_file_imports", {"file_path": val},
+                                        file_path=val),
+                    ], timeout=GATHER_TIMEOUT)
                     if res:
                         syms = _extract_symbols(res)
                         if syms:
                             flat = _flatten_symbols(syms)
                             lines.append(f"  {_rel(val, cwd)}: {_fmt_symbol_list(flat, limit=8)}")
+                    imp_line = _fmt_imports(imp_data)
+                    if imp_line:
+                        lines.append(f"    {imp_line}")
                 else:
                     res = await self._tc_cached("lsp_find_symbol", {
                         "name": val,
@@ -1251,8 +1435,13 @@ class LSPHooksDaemon:
 
     async def _h_session_start(self, _file_path: str, _tool_input: dict, cwd: str) -> str:
         try:
-            res = await self._tc_cached("lsp_workspace_symbols", {"query": " ", "limit": 20},
-                                        file_path=None)
+            (res, ws_diag), _ = await _gather_partial([
+                self._tc_cached("lsp_workspace_symbols", {"query": " ", "limit": 20},
+                                file_path=None),
+                self._tc_cached("lsp_workspace_diagnostics", {
+                    "severity_filter": "error", "limit": 5, "group_by": "file",
+                }, file_path=None),
+            ], timeout=GATHER_TIMEOUT)
         except Exception:
             return "[LSP] Language server starting up, context available shortly"
 
@@ -1274,6 +1463,19 @@ class LSPHooksDaemon:
                 if len(names) > 5:
                     display += f" ({len(names)} total)"
                 lines.append(f"  {kind}s: {display}")
+
+        # Workspace health
+        if ws_diag:
+            ws_items = _extract_list(ws_diag, "diagnostics", "items")
+            if ws_items:
+                err_count = len(ws_items)
+                lines.append(f"  Errors: {err_count} diagnostic error(s)")
+                for item in ws_items[:3]:
+                    if isinstance(item, dict):
+                        fp = item.get("file", item.get("path", ""))
+                        msg = item.get("message", str(item))[:80]
+                        ln = item.get("line", "?")
+                        lines.append(f"    {_rel(fp, cwd)}:{ln}: {msg}")
 
         return "\n".join(lines) if len(lines) > 1 else ""
 

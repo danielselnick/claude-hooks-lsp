@@ -50,8 +50,10 @@ LSP_SERVERS = [
         "id": "rust-analyzer",
         "binary": "rust-analyzer",
         "languages": "Rust (.rs)",
-        "install": _cargo_install("rust-analyzer"),
-        "install_hint": "cargo install rust-analyzer",
+        "install": lambda: subprocess.run(
+            ["rustup", "component", "add", "rust-analyzer"], check=True,
+        ),
+        "install_hint": "rustup component add rust-analyzer",
     },
     {
         "id": "typescript-language-server",
