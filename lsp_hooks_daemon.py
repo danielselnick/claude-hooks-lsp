@@ -363,6 +363,33 @@ def _display_kind(kind: str) -> str:
     return _KIND_LABELS.get(kind, kind)
 
 
+def _filter_symbols_by_range(symbols: list, start: int, end: int) -> list:
+    """Filter symbol tree to only symbols overlapping LSP line range [start, end] (0-indexed).
+
+    Parent symbols are included if any child is in range, but only in-range children are kept.
+    """
+    result = []
+    for s in symbols:
+        sr = s.get("range", {})
+        sym_start = sr.get("start", {}).get("line", 0)
+        sym_end = sr.get("end", {}).get("line", sym_start)
+
+        children = s.get("children", [])
+        if children:
+            filtered_children = _filter_symbols_by_range(children, start, end)
+            if filtered_children:
+                # Parent included with only in-range children
+                copy = {k: v for k, v in s.items() if k != "children"}
+                copy["children"] = filtered_children
+                result.append(copy)
+                continue
+
+        # Leaf or childless parent: include if range overlaps
+        if sym_start <= end and sym_end >= start:
+            result.append(s)
+    return result
+
+
 def _fmt_symbol_tree(symbols: list, limit: int = 20) -> str:
     """Format symbols as an indented tree showing nesting (impl > methods).
 
@@ -706,7 +733,13 @@ class LSPHooksDaemon:
 
         # Include content hash when file_path is empty to avoid key collisions
         if file_path:
-            cache_key = f"{event}:{file_path}"
+            # Include offset/limit in cache key for range-scoped pre-read
+            r_offset = tool_input.get("offset")
+            r_limit = tool_input.get("limit")
+            if r_offset is not None or r_limit is not None:
+                cache_key = f"{event}:{file_path}:{r_offset}:{r_limit}"
+            else:
+                cache_key = f"{event}:{file_path}"
         else:
             import hashlib
             content_hash = hashlib.md5(
@@ -769,6 +802,19 @@ class LSPHooksDaemon:
         if len(self.recent_reads) > 50:
             # Discard arbitrary element to cap size
             self.recent_reads.pop()
+
+        # Determine visible line range (Read offset/limit are 1-indexed)
+        offset = tool_input.get("offset")  # 1-indexed start line
+        limit = tool_input.get("limit")    # number of lines
+        if offset is not None or limit is not None:
+            start_1 = offset if offset is not None else 1
+            # Convert to 0-indexed LSP lines
+            lsp_start = start_1 - 1
+            lsp_end = (start_1 + limit - 2) if limit is not None else None
+        else:
+            lsp_start = None
+            lsp_end = None
+
         (syms_r, diag_r, exp_r), n_pending = await _gather_partial([
             self._tc_cached("lsp_document_symbols", {"file_path": file_path},
                             file_path=file_path),
@@ -781,21 +827,36 @@ class LSPHooksDaemon:
             log.debug("[%s] pre-read: %d/3 MCP calls timed out", _rid(), n_pending)
 
         rel = _rel(file_path, cwd)
-        lines: list[str] = [f"[LSP] Structure of {rel}:"]
+        range_suffix = f" (L{offset}-{offset + limit - 1})" if offset is not None and limit is not None else ""
+        lines: list[str] = [f"[LSP] Structure of {rel}{range_suffix}:"]
 
         if syms_r:
             syms = _extract_symbols(syms_r)
+            # Filter symbols to visible line range
+            if syms and lsp_start is not None:
+                syms = _filter_symbols_by_range(
+                    syms, lsp_start,
+                    lsp_end if lsp_end is not None else float("inf"),
+                )
             if syms:
                 tree = _fmt_symbol_tree(syms, limit=20)
                 if tree:
                     lines.append(tree)
 
+        # Exports always included (cheap one-liner)
         exp_line = _fmt_exports(exp_r)
         if exp_line:
             lines.append(exp_line)
 
         if diag_r:
             diag_list = _extract_list(diag_r, "diagnostics")
+            # Filter diagnostics to visible line range
+            if diag_list and lsp_start is not None:
+                diag_list = [
+                    d for d in diag_list
+                    if isinstance(d, dict) and
+                    lsp_start <= d.get("range", {}).get("start", {}).get("line", d.get("line", 0)) <= (lsp_end if lsp_end is not None else float("inf"))
+                ]
             if diag_list:
                 lines.append(f"Diagnostics: {len(diag_list)} error(s)")
                 for d in diag_list[:3]:
