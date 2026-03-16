@@ -1,8 +1,43 @@
 # lsp-hooks
 
-Proactive LSP context injection for Claude Code.
+**A structural knowledge graph for Claude Code.**
 
-Automatically gives Claude structural knowledge of your codebase — symbols, diagnostics, type info, call graphs — before every read, write, and prompt.
+lsp-hooks gives Claude a formal understanding of your codebase's type system, symbol hierarchy, call graph, and diagnostics — injected automatically before every tool call. Claude doesn't grep and hope; it already knows.
+
+## Why lsp-hooks?
+
+There are three ways to give an AI agent access to language intelligence. Two of them don't work well in practice.
+
+| Approach | Model | Problem |
+|---|---|---|
+| **Plain LSP** (IDE-style) | Pull-only — the model must know what to ask for | Great for autocomplete. Useless for an agent that doesn't know what it doesn't know. Claude would need to issue dozens of LSP queries per task, and it has no reason to. |
+| **MCP server** (tool-based) | Request/response — Claude *can* call LSP tools | Claude must decide to query. In practice it rarely does, burning tokens re-reading files and guessing at structure instead. |
+| **lsp-hooks** (push model) | Context injected *before* every tool call via hooks | Claude never has to ask. It already knows the symbol tree, callers, diagnostics, and exports before it reads, writes, or builds. Zero-effort, zero-token-waste structural awareness. |
+
+The key insight: **push, not pull.** Claude Code's hook system lets lsp-hooks inject LSP context into the system message before every read, write, build, search, and prompt. The agent receives structural knowledge as a side effect of acting — no extra tool calls, no wasted tokens, no missed context.
+
+## How It Helps Plan Mode
+
+lsp-hooks transforms Plan Mode from "grep and hope" into "reason over a knowledge graph":
+
+- **Session start** — Claude receives a project-wide structural overview (workspace symbols grouped by kind: structs, functions, traits, enums)
+- **Before every file read** — Symbol tree + diagnostics + exports. Claude knows the shape of a file before seeing raw text
+- **Before every edit** — Full call graph, references, implementations. Claude understands blast radius before changing a single line
+- **Before build commands** — Pre-build diagnostics surface known errors before wasting a build cycle
+- **Cache eviction is skipped during Plan Mode** — The warm knowledge graph persists across the planning/execution boundary
+
+**Net effect:** Plan Mode operates on a formal knowledge graph instead of grepping and hoping. Fewer file reads, fewer wrong turns, faster plans.
+
+## The Knowledge Graph
+
+lsp-hooks builds and maintains a live structural model of your codebase:
+
+- **Persistent daemon** maintains a two-layer cache (in-memory TTL + SQLite on disk)
+- **Language servers** provide the ground truth — types, call hierarchies, references, diagnostics
+- **Every hook event enriches the graph** — reads warm the cache, writes invalidate stale entries
+- **Partial results are always returned** — parallel LSP queries with a gather timeout mean some context is always better than none
+- **The graph survives across sessions** — SQLite cache persists across daemon restarts; in-memory cache warms up as you work
+- **First miss, second hit** — If a query exceeds the hook timeout, the daemon finishes the work and caches the result. Next invocation is instant.
 
 ## Quick Start
 
@@ -80,7 +115,7 @@ At least one LSP server for your language(s):
 
 | Language | Server | Install |
 |---|---|---|
-| Rust | rust-analyzer | `cargo install rust-analyzer` |
+| Rust | rust-analyzer | `rustup component add rust-analyzer` |
 | Python | pylsp | `uv tool install python-lsp-server` |
 | TypeScript/JS | typescript-language-server | `npm install -g typescript-language-server` |
 | C# | csharp-ls | `dotnet tool install --global csharp-ls` |
