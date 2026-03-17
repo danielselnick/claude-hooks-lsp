@@ -24,6 +24,7 @@ CORE_TOOLS = frozenset([
     "lsp_diagnostics",
     "lsp_file_exports",
     "lsp_file_imports",
+    "lsp_related_files",
 ])
 
 
