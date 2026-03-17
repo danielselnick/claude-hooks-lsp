@@ -1,7 +1,7 @@
 """SQLite L2 cache for lsp-hooks daemon.
 
 Persistent cache keyed by tool_name + SHA-256(canonical JSON args) with
-mtime-based invalidation for file-scoped entries and TTL for workspace ops.
+mtime + content-SHA invalidation for file-scoped entries and TTL for workspace ops.
 """
 
 from __future__ import annotations
@@ -15,8 +15,16 @@ import time
 
 log = logging.getLogger("lsp_hooks_daemon")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 WORKSPACE_TTL = 300.0  # 5 minutes for non-file-scoped entries
+
+# Core tools that the file watcher pre-caches for every file
+CORE_TOOLS = frozenset([
+    "lsp_document_symbols",
+    "lsp_diagnostics",
+    "lsp_file_exports",
+    "lsp_file_imports",
+])
 
 
 def _args_hash(args: dict) -> str:
@@ -29,9 +37,22 @@ def _file_mtime_ns(path: str) -> int | None:
     """Return st_mtime_ns for path, or None if file doesn't exist."""
     try:
         return os.stat(path).st_mtime_ns
-    except FileNotFoundError:
+    except (FileNotFoundError, OSError):
         return None
-    except OSError:
+
+
+def _file_content_sha(path: str) -> str | None:
+    """Return SHA-256 hex digest of file content, or None if unreadable."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(8192)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except (FileNotFoundError, OSError, PermissionError):
         return None
 
 
@@ -79,6 +100,7 @@ class SQLiteCache:
                 args_hash TEXT NOT NULL,
                 file_path TEXT,
                 file_mtime_ns INTEGER,
+                content_sha TEXT,
                 result_json TEXT NOT NULL,
                 created_at REAL NOT NULL,
                 last_hit_at REAL NOT NULL,
@@ -102,15 +124,15 @@ class SQLiteCache:
             conn = self._ensure_conn()
             ah = _args_hash(args)
             row = conn.execute(
-                "SELECT id, file_path, file_mtime_ns, result_json, created_at "
+                "SELECT id, file_path, file_mtime_ns, content_sha, result_json, created_at "
                 "FROM tool_cache WHERE tool_name=? AND args_hash=?",
                 (tool_name, ah),
             ).fetchone()
             if row is None:
                 return None
-            row_id, row_fp, row_mtime, result_json, created_at = row
+            row_id, row_fp, row_mtime, row_sha, result_json, created_at = row
 
-            # File-scoped: validate mtime
+            # File-scoped: validate mtime + content SHA
             if row_fp:
                 current_mtime = _file_mtime_ns(row_fp)
                 if current_mtime is None:
@@ -119,6 +141,17 @@ class SQLiteCache:
                     conn.commit()
                     return None
                 if current_mtime != row_mtime:
+                    # mtime changed — check content SHA for real change
+                    current_sha = _file_content_sha(row_fp)
+                    if current_sha and row_sha and current_sha == row_sha:
+                        # Content unchanged (e.g. touch) — update mtime in-place
+                        conn.execute(
+                            "UPDATE tool_cache SET file_mtime_ns=?, last_hit_at=?, hit_count=hit_count+1 WHERE id=?",
+                            (current_mtime, time.time(), row_id),
+                        )
+                        conn.commit()
+                        return json.loads(result_json)
+                    # Content actually changed — stale
                     conn.execute("DELETE FROM tool_cache WHERE id=?", (row_id,))
                     conn.commit()
                     return None
@@ -160,21 +193,86 @@ class SQLiteCache:
             conn = self._ensure_conn()
             ah = _args_hash(args)
             mtime = _file_mtime_ns(file_path) if file_path else None
+            sha = _file_content_sha(file_path) if file_path else None
             now = time.time()
             conn.execute(
                 "INSERT INTO tool_cache "
-                "(tool_name, args_hash, file_path, file_mtime_ns, result_json, "
+                "(tool_name, args_hash, file_path, file_mtime_ns, content_sha, result_json, "
                 "created_at, last_hit_at, hit_count) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 0) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0) "
                 "ON CONFLICT(tool_name, args_hash) DO UPDATE SET "
                 "file_mtime_ns=excluded.file_mtime_ns, "
+                "content_sha=excluded.content_sha, "
                 "result_json=excluded.result_json, "
                 "last_hit_at=excluded.last_hit_at",
-                (tool_name, ah, file_path, mtime, result_json, now, now),
+                (tool_name, ah, file_path, mtime, sha, result_json, now, now),
             )
             conn.commit()
         except Exception as e:
             log.warning("sqlite cache put error: %s", e)
+
+    def get_all_for_file(self, file_path: str) -> dict[str, object]:
+        """Return {tool_name: result} for all cached entries for a file.
+
+        Validates mtime+sha freshness. Returns only fresh entries.
+        """
+        try:
+            conn = self._ensure_conn()
+            current_mtime = _file_mtime_ns(file_path)
+            if current_mtime is None:
+                return {}
+            rows = conn.execute(
+                "SELECT tool_name, file_mtime_ns, content_sha, result_json "
+                "FROM tool_cache WHERE file_path=?",
+                (file_path,),
+            ).fetchall()
+            result = {}
+            for tool_name, row_mtime, row_sha, result_json in rows:
+                if row_mtime == current_mtime:
+                    result[tool_name] = json.loads(result_json)
+                elif row_sha:
+                    current_sha = _file_content_sha(file_path)
+                    if current_sha and current_sha == row_sha:
+                        result[tool_name] = json.loads(result_json)
+            return result
+        except Exception as e:
+            log.warning("sqlite cache get_all_for_file error: %s", e)
+            return {}
+
+    def has_fresh_entry(self, file_path: str, mtime_ns: int, content_sha: str) -> bool:
+        """Check if ALL core tools are cached fresh for this file."""
+        try:
+            conn = self._ensure_conn()
+            rows = conn.execute(
+                "SELECT tool_name, file_mtime_ns, content_sha "
+                "FROM tool_cache WHERE file_path=?",
+                (file_path,),
+            ).fetchall()
+            cached_tools = set()
+            for tool_name, row_mtime, row_sha in rows:
+                if tool_name in CORE_TOOLS:
+                    if row_mtime == mtime_ns or (row_sha and row_sha == content_sha):
+                        cached_tools.add(tool_name)
+            return CORE_TOOLS.issubset(cached_tools)
+        except Exception as e:
+            log.warning("sqlite cache has_fresh_entry error: %s", e)
+            return False
+
+    def all_cached_files(self) -> dict[str, tuple[int | None, str | None]]:
+        """Return {file_path: (mtime_ns, content_sha)} for all file-scoped entries."""
+        try:
+            conn = self._ensure_conn()
+            rows = conn.execute(
+                "SELECT DISTINCT file_path, file_mtime_ns, content_sha "
+                "FROM tool_cache WHERE file_path IS NOT NULL"
+            ).fetchall()
+            result = {}
+            for fp, mtime, sha in rows:
+                result[fp] = (mtime, sha)
+            return result
+        except Exception as e:
+            log.warning("sqlite cache all_cached_files error: %s", e)
+            return {}
 
     def invalidate_file(self, file_path: str):
         """Remove all cached entries for a specific file."""

@@ -15,8 +15,11 @@ import time
 import uuid
 from pathlib import Path
 
+import hashlib as _hashlib
+import subprocess as _subprocess
+
 from lsp_hooks_paths import LOG_PATH, SOCKET_PATH, PID_PATH, VERSION_PATH, CACHE_DB_PATH
-from lsp_hooks_cache import SQLiteCache
+from lsp_hooks_cache import SQLiteCache, _file_mtime_ns, _file_content_sha, CORE_TOOLS
 
 logging.basicConfig(
     filename=LOG_PATH,
@@ -51,6 +54,11 @@ DEFAULTS = {
         "max_callers_shown": 10000,
     },
     "cache_ttl_seconds": 60,
+    "file_watcher": {
+        "enabled": True,
+        "batch_size": 4,
+        "debounce_ms": 500,
+    },
 }
 
 
@@ -271,6 +279,103 @@ class Cache:
 
     def invalidate(self, key: str):
         self._store.pop(key, None)
+
+    def invalidate_prefix(self, prefix: str):
+        """Remove all entries whose key starts with prefix."""
+        to_del = [k for k in self._store if k.startswith(prefix)]
+        for k in to_del:
+            del self._store[k]
+
+
+# ---------------------------------------------------------------------------
+# File Watcher — OS-native via watchfiles
+# ---------------------------------------------------------------------------
+
+# Supported source extensions for ingestion
+_SOURCE_EXTS = frozenset([
+    ".rs", ".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
+    ".cs", ".go", ".java", ".kt", ".swift", ".c", ".cpp", ".h", ".hpp",
+    ".rb", ".lua", ".zig", ".toml", ".json",
+])
+
+# Directories to skip during enumeration/watching
+_SKIP_DIRS = frozenset([
+    "node_modules", ".git", "target", "__pycache__", ".mypy_cache",
+    ".pytest_cache", "dist", "build", ".next", ".nuxt", "venv", ".venv",
+    ".tox", ".eggs", "*.egg-info",
+])
+
+
+def _is_source_file(path: str) -> bool:
+    """Check if a file path has a supported source extension."""
+    _, ext = os.path.splitext(path)
+    return ext.lower() in _SOURCE_EXTS
+
+
+def _enumerate_files(cwd: str) -> list[str]:
+    """Enumerate project source files. Uses git ls-files if in a git repo, else os.walk."""
+    files = []
+    try:
+        result = _subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=cwd, capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            for rel in result.stdout.splitlines():
+                rel = rel.strip()
+                if not rel:
+                    continue
+                abs_path = os.path.join(cwd, rel)
+                if _is_source_file(abs_path):
+                    files.append(abs_path)
+            return files
+    except Exception:
+        pass
+
+    # Fallback: os.walk with exclusions
+    for dirpath, dirnames, filenames in os.walk(cwd):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for fname in filenames:
+            abs_path = os.path.join(dirpath, fname)
+            if _is_source_file(abs_path):
+                files.append(abs_path)
+    return files
+
+
+class FileWatcher:
+    """OS-native file watcher using watchfiles (Rust-backed)."""
+
+    def __init__(self, cwd: str, change_queue: asyncio.Queue):
+        self.cwd = cwd
+        self._change_queue = change_queue
+
+    async def watch(self, stop: asyncio.Event):
+        """Watch for file changes and enqueue them. Runs until stop is set."""
+        try:
+            from watchfiles import awatch, Change
+        except ImportError:
+            log.warning("watchfiles not installed, file watcher disabled")
+            await stop.wait()
+            return
+
+        def _watch_filter(change: Change, path: str) -> bool:
+            """Filter to only source files, excluding common non-source dirs."""
+            if not _is_source_file(path):
+                return False
+            for skip in _SKIP_DIRS:
+                if f"/{skip}/" in path or path.endswith(f"/{skip}"):
+                    return False
+            return True
+
+        try:
+            async for changes in awatch(self.cwd, watch_filter=_watch_filter,
+                                         stop_event=stop, debounce=1000,
+                                         rust_timeout=5000):
+                for change_type, path in changes:
+                    await self._change_queue.put((change_type, path))
+        except Exception as e:
+            if not stop.is_set():
+                log.warning("file watcher error: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -631,6 +736,15 @@ class LSPHooksDaemon:
         self._active_handlers: set = set()
         self._last_permission_mode = "default"
         self._version = "unknown"
+        # File watcher state
+        self._project_cwd: str | None = None
+        self._cwd_event = asyncio.Event()
+        self._change_queue: asyncio.Queue = asyncio.Queue()
+        self._file_watcher: FileWatcher | None = None
+        fw_cfg = config.get("file_watcher", {})
+        self._fw_enabled = fw_cfg.get("enabled", True)
+        self._fw_batch_size = fw_cfg.get("batch_size", 4)
+        self._fw_debounce_ms = fw_cfg.get("debounce_ms", 500)
 
     # -- lifecycle --
 
@@ -712,8 +826,6 @@ class LSPHooksDaemon:
         async def _cache_evictor():
             while not stop.is_set():
                 await asyncio.sleep(600)  # 10 minutes
-                if self._last_permission_mode == "plan":
-                    continue  # Never evict during plan mode
                 try:
                     self.sqlite_cache.evict_stale()
                 except Exception as e:
@@ -721,10 +833,18 @@ class LSPHooksDaemon:
 
         wd = asyncio.create_task(_watchdog())
         ev = asyncio.create_task(_cache_evictor())
+        # File watcher background tasks
+        ig = asyncio.create_task(self._background_ingest(stop)) if self._fw_enabled else None
+        cc = asyncio.create_task(self._change_consumer(stop)) if self._fw_enabled else None
         await stop.wait()
         wd.cancel()
         ev.cancel()
-        await asyncio.gather(wd, ev, return_exceptions=True)
+        if ig:
+            ig.cancel()
+        if cc:
+            cc.cancel()
+        all_tasks = [t for t in [wd, ev, ig, cc] if t is not None]
+        await asyncio.gather(*all_tasks, return_exceptions=True)
         await self.cleanup()
         print("[lsp-hooks] stopped", file=sys.stderr)
 
@@ -787,6 +907,12 @@ class LSPHooksDaemon:
 
         self._last_permission_mode = permission_mode
 
+        # Set project CWD for file watcher on first request
+        if cwd and self._project_cwd is None:
+            self._project_cwd = cwd
+            self._cwd_event.set()
+            log.info("project CWD set to %s", cwd)
+
         if not self.mcp.is_alive():
             try:
                 await self.mcp.start()
@@ -803,8 +929,7 @@ class LSPHooksDaemon:
             else:
                 cache_key = f"{event}:{file_path}"
         else:
-            import hashlib
-            content_hash = hashlib.md5(
+            content_hash = _hashlib.md5(
                 json.dumps(tool_input, sort_keys=True, default=str).encode()
             ).hexdigest()[:12]
             cache_key = f"{event}::{content_hash}"
@@ -857,6 +982,127 @@ class LSPHooksDaemon:
 
         return result
 
+    # --------------- file watcher ingestion ---------------
+
+    async def _ingest_file(self, file_path: str):
+        """Pre-cache core LSP data for a single file."""
+        mtime = _file_mtime_ns(file_path)
+        sha = _file_content_sha(file_path)
+        if mtime is None or sha is None:
+            return  # file gone or unreadable
+
+        # Skip if already cached with same mtime + sha
+        if self.sqlite_cache.has_fresh_entry(file_path, mtime, sha):
+            return
+
+        # Invalidate stale entries
+        self.sqlite_cache.invalidate_file(file_path)
+
+        # Fetch core LSP data (same 4 tools as pre-read)
+        await _gather_partial([
+            self._tc_cached("lsp_document_symbols", {"file_path": file_path},
+                            file_path=file_path),
+            self._tc_cached("lsp_diagnostics", {"file_path": file_path, "severity_filter": "error"},
+                            file_path=file_path),
+            self._tc_cached("lsp_file_exports", {"file_path": file_path},
+                            file_path=file_path),
+            self._tc_cached("lsp_file_imports", {"file_path": file_path},
+                            file_path=file_path),
+        ], timeout=GATHER_TIMEOUT)
+
+    async def _background_ingest(self, stop: asyncio.Event):
+        """Background task: enumerate all project files and pre-cache LSP data."""
+        # Wait for CWD to be known (set by first client request)
+        try:
+            await asyncio.wait_for(self._cwd_event.wait(), timeout=300)
+        except asyncio.TimeoutError:
+            log.warning("file watcher: no CWD received within 5 minutes, aborting ingestion")
+            return
+
+        cwd = self._project_cwd
+        if not cwd:
+            return
+
+        # Brief delay to let LSP server warm up
+        await asyncio.sleep(2.0)
+
+        log.info("background ingestion: starting for %s", cwd)
+        t0 = time.monotonic()
+
+        files = await asyncio.get_running_loop().run_in_executor(
+            None, _enumerate_files, cwd,
+        )
+        log.info("background ingestion: found %d source files", len(files))
+
+        ingested = 0
+        skipped = 0
+        batch_size = self._fw_batch_size
+
+        for i in range(0, len(files), batch_size):
+            if stop.is_set():
+                break
+            batch = files[i:i + batch_size]
+            await _gather_partial(
+                [self._ingest_file(fp) for fp in batch],
+                timeout=GATHER_TIMEOUT * 2,
+            )
+            ingested += len(batch)
+            if ingested % 50 == 0:
+                log.info("background ingestion: %d/%d files processed", ingested, len(files))
+            # Small yield to avoid starving request handlers
+            await asyncio.sleep(0.05)
+
+        elapsed = time.monotonic() - t0
+        log.info("background ingestion: done — %d files in %.1fs", ingested, elapsed)
+
+        # Start file watcher after initial ingestion
+        if self._fw_enabled and not stop.is_set():
+            self._file_watcher = FileWatcher(cwd, self._change_queue)
+            asyncio.create_task(self._file_watcher.watch(stop))
+            log.info("file watcher: started for %s", cwd)
+
+    async def _change_consumer(self, stop: asyncio.Event):
+        """Consume file change events from the watcher, debounce, and re-ingest."""
+        debounce_s = self._fw_debounce_ms / 1000.0
+
+        while not stop.is_set():
+            try:
+                # Wait for first change
+                change_type, path = await asyncio.wait_for(
+                    self._change_queue.get(), timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                continue
+
+            # Debounce: collect more changes for a short window
+            changed_paths: set[str] = {path}
+            deadline = time.monotonic() + debounce_s
+            while time.monotonic() < deadline:
+                try:
+                    _, p = await asyncio.wait_for(
+                        self._change_queue.get(), timeout=max(0, deadline - time.monotonic()),
+                    )
+                    changed_paths.add(p)
+                except asyncio.TimeoutError:
+                    break
+
+            # Invalidate L1 cache for changed files
+            for fp in changed_paths:
+                self.cache.invalidate_prefix(f"pre-read:{fp}")
+                self.cache.invalidate_prefix(f"pre-write:{fp}")
+
+            # Re-ingest changed files
+            batch = [fp for fp in changed_paths if os.path.isfile(fp)]
+            if batch:
+                log.info("file watcher: re-ingesting %d changed file(s)", len(batch))
+                # Invalidate L2 cache entries for changed files
+                for fp in batch:
+                    self.sqlite_cache.invalidate_file(fp)
+                await _gather_partial(
+                    [self._ingest_file(fp) for fp in batch],
+                    timeout=GATHER_TIMEOUT * 2,
+                )
+
     # --------------- handlers ---------------
 
     async def _h_pre_read(self, file_path: str, tool_input: dict, cwd: str) -> str:
@@ -877,18 +1123,29 @@ class LSPHooksDaemon:
             lsp_start = None
             lsp_end = None
 
-        (syms_r, diag_r, exp_r, imp_r), n_pending = await _gather_partial([
-            self._tc_cached("lsp_document_symbols", {"file_path": file_path},
-                            file_path=file_path),
-            self._tc_cached("lsp_diagnostics", {"file_path": file_path, "severity_filter": "error"},
-                            file_path=file_path),
-            self._tc_cached("lsp_file_exports", {"file_path": file_path},
-                            file_path=file_path),
-            self._tc_cached("lsp_file_imports", {"file_path": file_path},
-                            file_path=file_path),
-        ], timeout=GATHER_TIMEOUT)
-        if n_pending:
-            log.debug("[%s] pre-read: %d/4 MCP calls timed out", _rid(), n_pending)
+        # Try pre-populated cache from file watcher first
+        cached_data = self.sqlite_cache.get_all_for_file(file_path)
+        if len(cached_data) >= len(CORE_TOOLS):
+            syms_r = cached_data.get("lsp_document_symbols")
+            diag_r = cached_data.get("lsp_diagnostics")
+            exp_r = cached_data.get("lsp_file_exports")
+            imp_r = cached_data.get("lsp_file_imports")
+            n_pending = 0
+            log.debug("[%s] pre-read: served from file watcher cache", _rid())
+        else:
+            # Graceful degradation: fetch on-demand if not yet ingested
+            (syms_r, diag_r, exp_r, imp_r), n_pending = await _gather_partial([
+                self._tc_cached("lsp_document_symbols", {"file_path": file_path},
+                                file_path=file_path),
+                self._tc_cached("lsp_diagnostics", {"file_path": file_path, "severity_filter": "error"},
+                                file_path=file_path),
+                self._tc_cached("lsp_file_exports", {"file_path": file_path},
+                                file_path=file_path),
+                self._tc_cached("lsp_file_imports", {"file_path": file_path},
+                                file_path=file_path),
+            ], timeout=GATHER_TIMEOUT)
+            if n_pending:
+                log.debug("[%s] pre-read: %d/4 MCP calls timed out", _rid(), n_pending)
 
         rel = _rel(file_path, cwd)
         range_suffix = f" (L{offset}-{offset + limit - 1})" if offset is not None and limit is not None else ""
@@ -985,10 +1242,9 @@ class LSPHooksDaemon:
             if len(self.recent_writes) > 20:
                 self.recent_writes.pop(0)
 
-        # Invalidate stale caches (L1 + L2)
+        # Invalidate L1 cache — L2 will be refreshed by file watcher after write
         for ev in ("pre-read", "pre-write"):
             self.cache.invalidate(f"{ev}:{file_path}")
-        self.sqlite_cache.invalidate_file(file_path)
 
         # Step 1 — symbols (flatten tree to reach methods inside impl blocks)
         syms_data = await self._tc_cached("lsp_document_symbols", {"file_path": file_path},
@@ -1151,20 +1407,33 @@ class LSPHooksDaemon:
 
         if self.recent_writes:
             recent = self.recent_writes[-5:]
-            tasks = [
-                self._tc_cached("lsp_diagnostics", {"file_path": fp, "severity_filter": "error"},
-                                file_path=fp)
-                for fp in recent
-            ]
-            # Also get workspace-wide diagnostics
+            # Try file watcher cache first for per-file diagnostics
+            per_file_results = []
+            uncached_fps = []
+            for fp in recent:
+                cached_data = self.sqlite_cache.get_all_for_file(fp)
+                diag = cached_data.get("lsp_diagnostics")
+                if diag is not None:
+                    per_file_results.append(diag)
+                else:
+                    uncached_fps.append((len(per_file_results), fp))
+                    per_file_results.append(None)
+
+            # Fetch uncached diagnostics on-demand + workspace diagnostics
+            tasks = []
+            for _, fp in uncached_fps:
+                tasks.append(self._tc_cached("lsp_diagnostics", {"file_path": fp, "severity_filter": "error"},
+                                             file_path=fp))
             tasks.append(self._tc_cached("lsp_workspace_diagnostics", {
                 "severity_filter": "error", "limit": 5, "group_by": "file",
             }, file_path=None))
             results, n_pending = await _gather_partial(tasks, timeout=GATHER_TIMEOUT)
             if n_pending:
-                log.debug("[%s] pre-bash: %d/%d diagnostic calls timed out", _rid(), n_pending, len(tasks))
-            per_file_results = results[:len(recent)]
-            ws_diag = results[len(recent)] if len(results) > len(recent) else None
+                log.debug("[%s] pre-bash: %d/%d calls timed out", _rid(), n_pending, len(tasks))
+            # Fill in uncached results
+            for i, (idx, _fp) in enumerate(uncached_fps):
+                per_file_results[idx] = results[i] if i < len(results) else None
+            ws_diag = results[len(uncached_fps)] if len(results) > len(uncached_fps) else None
             lines = ["[LSP] Pre-build diagnostics:"]
             has = False
             for fp, res in zip(recent, per_file_results):
@@ -1393,12 +1662,18 @@ class LSPHooksDaemon:
         for etype, val in entities[:3]:
             try:
                 if etype == "file":
-                    (res, imp_data), _ = await _gather_partial([
-                        self._tc_cached("lsp_document_symbols", {"file_path": val},
-                                        file_path=val),
-                        self._tc_cached("lsp_file_imports", {"file_path": val},
-                                        file_path=val),
-                    ], timeout=GATHER_TIMEOUT)
+                    # Try file watcher cache first
+                    cached_data = self.sqlite_cache.get_all_for_file(val)
+                    if "lsp_document_symbols" in cached_data and "lsp_file_imports" in cached_data:
+                        res = cached_data["lsp_document_symbols"]
+                        imp_data = cached_data["lsp_file_imports"]
+                    else:
+                        (res, imp_data), _ = await _gather_partial([
+                            self._tc_cached("lsp_document_symbols", {"file_path": val},
+                                            file_path=val),
+                            self._tc_cached("lsp_file_imports", {"file_path": val},
+                                            file_path=val),
+                        ], timeout=GATHER_TIMEOUT)
                     if res:
                         syms = _extract_symbols(res)
                         if syms:
