@@ -220,12 +220,11 @@ class TestE2EPipeline:
         }
         rc, stdout, stderr = await _run_client(e2e_daemon, "pre-read", hook_input)
         assert rc == 0, f"Client exited with code {rc}, stderr: {stderr}"
-
-        if stdout.strip():
-            output = json.loads(stdout.strip())
-            assert output.get("continue") is True
-            assert "systemMessage" in output
-            assert "[LSP]" in output["systemMessage"]
+        assert stdout.strip(), f"Expected non-empty stdout, stderr: {stderr}"
+        output = json.loads(stdout.strip())
+        assert output.get("continue") is True
+        assert "systemMessage" in output
+        assert "[LSP]" in output["systemMessage"]
 
     async def test_e2e_pre_write_pipeline(self, e2e_daemon):
         fp = os.path.join(e2e_daemon["project_dir"], "main.py")
@@ -241,10 +240,9 @@ class TestE2EPipeline:
         }
         rc, stdout, stderr = await _run_client(e2e_daemon, "pre-write", hook_input)
         assert rc == 0, f"stderr: {stderr}"
-
-        if stdout.strip():
-            output = json.loads(stdout.strip())
-            assert output.get("continue") is True
+        assert stdout.strip(), f"Expected non-empty stdout, stderr: {stderr}"
+        output = json.loads(stdout.strip())
+        assert output.get("continue") is True
 
     async def test_e2e_session_start_pipeline(self, e2e_daemon):
         hook_input = {
@@ -255,7 +253,8 @@ class TestE2EPipeline:
         }
         rc, stdout, stderr = await _run_client(e2e_daemon, "session-start", hook_input)
         assert rc == 0, f"stderr: {stderr}"
-
+        # session-start may produce empty output if the client's version check
+        # consumes the socket and reconnection fails in the E2E subprocess context
         if stdout.strip():
             output = json.loads(stdout.strip())
             assert output.get("continue") is True

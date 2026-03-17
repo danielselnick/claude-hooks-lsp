@@ -78,14 +78,14 @@ MOCK_RESPONSES = {
     },
     "lsp_hover": {
         "content": [{"type": "text", "text": json.dumps({
-            "content": "(function) def main() -> None",
+            "contents": "(function) def main() -> None",
         })}],
     },
     "lsp_smart_search": {
         "content": [{"type": "text", "text": json.dumps({
             "definition": {"path": "/project/main.py", "line": 1, "column": 5},
             "references": {"total_count": 3, "items": []},
-            "hover": {"content": "def main() -> None"},
+            "hover": {"contents": "def main() -> None"},
         })}],
     },
     "lsp_workspace_symbols": {

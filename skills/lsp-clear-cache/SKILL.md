@@ -12,7 +12,7 @@ Follow these steps exactly:
 ## 1. Resolve all runtime paths
 
 ```bash
-cd "${CLAUDE_PLUGIN_ROOT}" && python3 -c "
+cd "${CLAUDE_PLUGIN_ROOT}" && uv run python -c "
 from lsp_hooks_paths import *
 print(f'PID_PATH={PID_PATH}')
 print(f'LOG_PATH={LOG_PATH}')
@@ -76,7 +76,7 @@ fi
 ## 6. Start a fresh daemon
 
 ```bash
-cd "${CLAUDE_PLUGIN_ROOT}" && python3 lsp_hooks_daemon.py &
+cd "${CLAUDE_PLUGIN_ROOT}" && uv run lsp_hooks_daemon.py &
 disown
 sleep 0.5
 ```

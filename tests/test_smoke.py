@@ -210,5 +210,7 @@ class TestEmptyEvent:
             event="",
             cwd="/tmp",
         )
-        # Empty event may return ok=false (no handler) or ok=true with empty context
         assert "ok" in resp
+        # Empty event should either fail or return empty context
+        if resp["ok"]:
+            assert resp.get("context", "") == "", "Empty event should not produce context"

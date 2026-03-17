@@ -153,11 +153,12 @@ class MCPClient:
             "capabilities": {},
             "clientInfo": {"name": "lsp-hooks", "version": "1.0.0"},
         })
-        await self._send_raw({
-            "jsonrpc": "2.0",
-            "method": "notifications/initialized",
-            "params": {},
-        })
+        async with self._write_lock:
+            await self._send_raw({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {},
+            })
         return resp
 
     # -- low-level IO --
@@ -303,7 +304,7 @@ _SOURCE_EXTS = frozenset([
 _SKIP_DIRS = frozenset([
     "node_modules", ".git", "target", "__pycache__", ".mypy_cache",
     ".pytest_cache", "dist", "build", ".next", ".nuxt", "venv", ".venv",
-    ".tox", ".eggs", "*.egg-info",
+    ".tox", ".eggs",
 ])
 
 
@@ -335,7 +336,7 @@ def _enumerate_files(cwd: str) -> list[str]:
 
     # Fallback: os.walk with exclusions
     for dirpath, dirnames, filenames in os.walk(cwd):
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.endswith(".egg-info")]
         for fname in filenames:
             abs_path = os.path.join(dirpath, fname)
             if _is_source_file(abs_path):
@@ -346,9 +347,10 @@ def _enumerate_files(cwd: str) -> list[str]:
 class FileWatcher:
     """OS-native file watcher using watchfiles (Rust-backed)."""
 
-    def __init__(self, cwd: str, change_queue: asyncio.Queue):
+    def __init__(self, cwd: str, change_queue: asyncio.Queue, debounce_ms: int = 500):
         self.cwd = cwd
         self._change_queue = change_queue
+        self._debounce_ms = debounce_ms
 
     async def watch(self, stop: asyncio.Event):
         """Watch for file changes and enqueue them. Runs until stop is set."""
@@ -366,11 +368,13 @@ class FileWatcher:
             for skip in _SKIP_DIRS:
                 if f"/{skip}/" in path or path.endswith(f"/{skip}"):
                     return False
+            if ".egg-info/" in path or path.endswith(".egg-info"):
+                return False
             return True
 
         try:
             async for changes in awatch(self.cwd, watch_filter=_watch_filter,
-                                         stop_event=stop, debounce=1000,
+                                         stop_event=stop, debounce=self._debounce_ms,
                                          rust_timeout=5000):
                 for change_type, path in changes:
                     await self._change_queue.put((change_type, path))
@@ -444,7 +448,12 @@ def _extract_symbols(data) -> list:
 
 
 def _flatten_symbols(symbols: list) -> list:
-    """Recursively flatten symbol tree into a flat list with depth info."""
+    """Recursively flatten symbol tree into a flat list with depth info.
+
+    Note: mutates each symbol dict in-place by adding ``_depth``.  This is
+    intentional — the key is only used for indentation in ``_fmt_symbol_tree``
+    and does not interfere with cache lookups or other consumers.
+    """
     result = []
     def _walk(syms, depth=0):
         for s in syms:
@@ -776,6 +785,9 @@ class LSPHooksDaemon:
         self._fw_enabled = fw_cfg.get("enabled", True)
         self._fw_batch_size = fw_cfg.get("batch_size", 4)
         self._fw_debounce_ms = fw_cfg.get("debounce_ms", 500)
+        self._ingest_locks: dict[str, asyncio.Lock] = {}
+        self._initial_ingest_done = asyncio.Event()
+        self._watch_task: asyncio.Task | None = None
 
     # -- lifecycle --
 
@@ -843,40 +855,47 @@ class LSPHooksDaemon:
         for s in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(s, _sig)
 
-        async def _watchdog():
-            while not stop.is_set():
-                if not self.mcp.is_alive():
-                    print("[lsp-hooks] MCP died, restarting…", file=sys.stderr)
+        try:
+            async def _watchdog():
+                while not stop.is_set():
+                    if not self.mcp.is_alive():
+                        print("[lsp-hooks] MCP died, restarting…", file=sys.stderr)
+                        try:
+                            await self.mcp.start()
+                            print("[lsp-hooks] MCP restarted", file=sys.stderr)
+                        except Exception as e:
+                            print(f"[lsp-hooks] restart failed: {e}", file=sys.stderr)
+                    await asyncio.sleep(5)
+
+            async def _cache_evictor():
+                while not stop.is_set():
+                    await asyncio.sleep(600)  # 10 minutes
                     try:
-                        await self.mcp.start()
-                        print("[lsp-hooks] MCP restarted", file=sys.stderr)
+                        self.sqlite_cache.evict_stale()
                     except Exception as e:
-                        print(f"[lsp-hooks] restart failed: {e}", file=sys.stderr)
-                await asyncio.sleep(5)
+                        log.warning("cache eviction error: %s", e)
 
-        async def _cache_evictor():
-            while not stop.is_set():
-                await asyncio.sleep(600)  # 10 minutes
-                try:
-                    self.sqlite_cache.evict_stale()
-                except Exception as e:
-                    log.warning("cache eviction error: %s", e)
-
-        wd = asyncio.create_task(_watchdog())
-        ev = asyncio.create_task(_cache_evictor())
-        # File watcher background tasks
-        ig = asyncio.create_task(self._background_ingest(stop)) if self._fw_enabled else None
-        cc = asyncio.create_task(self._change_consumer(stop)) if self._fw_enabled else None
-        await stop.wait()
-        wd.cancel()
-        ev.cancel()
-        if ig:
-            ig.cancel()
-        if cc:
-            cc.cancel()
-        all_tasks = [t for t in [wd, ev, ig, cc] if t is not None]
-        await asyncio.gather(*all_tasks, return_exceptions=True)
-        await self.cleanup()
+            wd = asyncio.create_task(_watchdog())
+            ev = asyncio.create_task(_cache_evictor())
+            # File watcher background tasks
+            ig = asyncio.create_task(self._background_ingest(stop)) if self._fw_enabled else None
+            cc = asyncio.create_task(self._change_consumer(stop)) if self._fw_enabled else None
+            await stop.wait()
+            wd.cancel()
+            ev.cancel()
+            if ig:
+                ig.cancel()
+            if cc:
+                cc.cancel()
+            wt = self._watch_task
+            if wt:
+                wt.cancel()
+            all_tasks = [t for t in [wd, ev, ig, cc, wt] if t is not None]
+            await asyncio.gather(*all_tasks, return_exceptions=True)
+        finally:
+            for s in (signal.SIGTERM, signal.SIGINT):
+                loop.remove_signal_handler(s)
+            await self.cleanup()
         print("[lsp-hooks] stopped", file=sys.stderr)
 
     # -- socket handler --
@@ -1017,153 +1036,201 @@ class LSPHooksDaemon:
 
     async def _ingest_file(self, file_path: str):
         """Pre-cache ALL available LSP data for a single file."""
-        mtime = _file_mtime_ns(file_path)
-        sha = _file_content_sha(file_path)
-        if mtime is None or sha is None:
-            return  # file gone or unreadable
+        # Per-file lock to prevent concurrent ingestion of the same file
+        # setdefault is atomic in CPython, avoiding the race where two callers
+        # each create a different Lock for the same key.
+        lock = self._ingest_locks.setdefault(file_path, asyncio.Lock())
 
-        # Skip if already cached with same mtime + sha
-        if self.sqlite_cache.has_fresh_entry(file_path, mtime, sha):
-            return
+        async with lock:
+            mtime = _file_mtime_ns(file_path)
+            sha = _file_content_sha(file_path)
+            if mtime is None or sha is None:
+                return  # file gone or unreadable
 
-        # Invalidate stale entries
-        self.sqlite_cache.invalidate_file(file_path)
+            # Per-phase status — only skip phases that actually finished
+            status = self.sqlite_cache.get_ingest_status(file_path, mtime, sha)
+            if status["phase1"] and status["phase2"] and status["phase3"]:
+                return  # fully ingested
 
-        # Phase 1: file-level tools (no symbol positions needed)
-        (syms_r, diag_r, exp_r, imp_r, rel_r), _ = await _gather_partial([
-            self._tc_cached("lsp_document_symbols", {"file_path": file_path},
-                            file_path=file_path),
-            self._tc_cached("lsp_diagnostics", {"file_path": file_path, "severity_filter": "all"},
-                            file_path=file_path),
-            self._tc_cached("lsp_file_exports", {"file_path": file_path},
-                            file_path=file_path),
-            self._tc_cached("lsp_file_imports", {"file_path": file_path},
-                            file_path=file_path),
-            self._tc_cached("lsp_related_files", {"file_path": file_path, "relationship": "all"},
-                            file_path=file_path),
-        ], timeout=INGEST_TIMEOUT)
+            # If version changed, invalidate stale entries and reset status
+            if not status["phase1"] and not status["phase2"] and not status["phase3"]:
+                self.sqlite_cache.invalidate_file(file_path)
 
-        # Phase 2: per-symbol tools — ALL symbols, no caps
-        if syms_r:
-            all_syms = _flatten_symbols(_extract_symbols(syms_r))
-            for sym in all_syms:
-                sel = sym.get("selection_range", sym.get("range", {}))
-                ln = max(sel.get("start", {}).get("line", sym.get("line", 1)), 1)
-                col = max(sel.get("start", {}).get("column", sym.get("column", 1)), 1)
-
-                await _gather_partial([
-                    self._tc_cached("lsp_smart_search", {
-                        "file_path": file_path, "line": ln, "column": col,
-                        "include": ["definition", "references", "hover",
-                                    "implementations", "incoming_calls", "outgoing_calls"],
-                        "references_limit": 50,
-                    }, file_path=file_path),
-                    self._tc_cached("lsp_hover", {
-                        "file_path": file_path, "line": ln, "column": col,
-                    }, file_path=file_path),
-                    self._tc_cached("lsp_call_hierarchy", {
-                        "file_path": file_path, "line": ln, "column": col,
-                        "direction": "both",
-                    }, file_path=file_path),
-                    self._tc_cached("lsp_find_references", {
-                        "file_path": file_path, "line": ln, "column": col,
-                        "include_declaration": True, "limit": 500,
-                    }, file_path=file_path),
-                    self._tc_cached("lsp_find_implementations", {
-                        "file_path": file_path, "line": ln, "column": col,
-                        "limit": 100,
-                    }, file_path=file_path),
-                    self._tc_cached("lsp_type_hierarchy", {
-                        "file_path": file_path, "line": ln, "column": col,
-                        "direction": "both",
-                    }, file_path=file_path),
-                    self._tc_cached("lsp_goto_definition", {
-                        "file_path": file_path, "line": ln, "column": col,
-                    }, file_path=file_path),
-                    self._tc_cached("lsp_goto_type_definition", {
-                        "file_path": file_path, "line": ln, "column": col,
-                    }, file_path=file_path),
-                    self._tc_cached("lsp_signature_help", {
-                        "file_path": file_path, "line": ln, "column": col,
-                    }, file_path=file_path),
+            # Phase 1: file-level tools (no symbol positions needed)
+            syms_r = diag_r = None
+            if not status["phase1"]:
+                (syms_r, diag_r, exp_r, imp_r, rel_r), _ = await _gather_partial([
+                    self._tc_cached("lsp_document_symbols", {"file_path": file_path},
+                                    file_path=file_path),
+                    self._tc_cached("lsp_diagnostics", {"file_path": file_path, "severity_filter": "all"},
+                                    file_path=file_path),
+                    self._tc_cached("lsp_file_exports", {"file_path": file_path},
+                                    file_path=file_path),
+                    self._tc_cached("lsp_file_imports", {"file_path": file_path},
+                                    file_path=file_path),
+                    self._tc_cached("lsp_related_files", {"file_path": file_path, "relationship": "all"},
+                                    file_path=file_path),
                 ], timeout=INGEST_TIMEOUT)
+                self.sqlite_cache.set_ingest_phase(file_path, mtime, sha, 1)
+            else:
+                # Phase 1 already done — retrieve cached symbols/diagnostics for Phase 2/3
+                cached = self.sqlite_cache.get_all_for_file(file_path)
+                syms_r = cached.get("lsp_document_symbols")
+                diag_r = cached.get("lsp_diagnostics")
 
-        # Phase 3: code actions for diagnostic ranges
-        if diag_r:
-            diag_list = _extract_list(diag_r, "diagnostics")
-            ca_tasks = []
-            for d in diag_list:
-                if not isinstance(d, dict):
-                    continue
-                rng = d.get("range", {})
-                start = rng.get("start", {})
-                end = rng.get("end", {})
-                sl = max(start.get("line", 1), 1)
-                sc = max(start.get("column", 1), 1)
-                el = max(end.get("line", sl), 1)
-                ec = max(end.get("column", sc), 1)
-                ca_tasks.append(self._tc_cached("lsp_code_actions", {
-                    "file_path": file_path,
-                    "start_line": sl, "start_column": sc,
-                    "end_line": el, "end_column": ec,
-                    "kinds": ["quickfix", "refactor", "source.fixAll"],
-                }, file_path=file_path))
-            if ca_tasks:
-                await _gather_partial(ca_tasks, timeout=INGEST_TIMEOUT)
+            # Phase 2: per-symbol tools — ALL symbols, flattened into one gather
+            if not status["phase2"]:
+                if syms_r:
+                    all_syms = _flatten_symbols(_extract_symbols(syms_r))
+                    sym_tasks = []
+                    for sym in all_syms:
+                        sel = sym.get("selection_range", sym.get("range", {}))
+                        ln = max(sel.get("start", {}).get("line", sym.get("line", 1)), 1)
+                        col = max(sel.get("start", {}).get("column", sym.get("column", 1)), 1)
+
+                        sym_tasks.extend([
+                            self._tc_cached("lsp_smart_search", {
+                                "file_path": file_path, "line": ln, "column": col,
+                                "include": ["definition", "references", "hover",
+                                            "implementations", "incoming_calls", "outgoing_calls"],
+                                "references_limit": 50,
+                            }, file_path=file_path),
+                            self._tc_cached("lsp_hover", {
+                                "file_path": file_path, "line": ln, "column": col,
+                            }, file_path=file_path),
+                            self._tc_cached("lsp_call_hierarchy", {
+                                "file_path": file_path, "line": ln, "column": col,
+                                "direction": "both",
+                            }, file_path=file_path),
+                            self._tc_cached("lsp_find_references", {
+                                "file_path": file_path, "line": ln, "column": col,
+                                "include_declaration": True, "limit": 500,
+                            }, file_path=file_path),
+                            self._tc_cached("lsp_find_implementations", {
+                                "file_path": file_path, "line": ln, "column": col,
+                                "limit": 100,
+                            }, file_path=file_path),
+                            self._tc_cached("lsp_type_hierarchy", {
+                                "file_path": file_path, "line": ln, "column": col,
+                                "direction": "both",
+                            }, file_path=file_path),
+                            self._tc_cached("lsp_goto_definition", {
+                                "file_path": file_path, "line": ln, "column": col,
+                            }, file_path=file_path),
+                            self._tc_cached("lsp_goto_type_definition", {
+                                "file_path": file_path, "line": ln, "column": col,
+                            }, file_path=file_path),
+                            self._tc_cached("lsp_signature_help", {
+                                "file_path": file_path, "line": ln, "column": col,
+                            }, file_path=file_path),
+                        ])
+                    if sym_tasks:
+                        _, n_pending = await _gather_partial(sym_tasks, timeout=INGEST_TIMEOUT)
+                        if n_pending:
+                            log.debug("_ingest_file: %d/%d sym tasks timed out for %s",
+                                      n_pending, len(sym_tasks), file_path)
+                        else:
+                            self.sqlite_cache.set_ingest_phase(file_path, mtime, sha, 2)
+                    else:
+                        self.sqlite_cache.set_ingest_phase(file_path, mtime, sha, 2)
+                else:
+                    # No symbols → Phase 2 trivially done
+                    self.sqlite_cache.set_ingest_phase(file_path, mtime, sha, 2)
+
+            # Phase 3: code actions for diagnostic ranges
+            if not status["phase3"]:
+                if diag_r:
+                    diag_list = _extract_list(diag_r, "diagnostics")
+                    ca_tasks = []
+                    for d in diag_list:
+                        if not isinstance(d, dict):
+                            continue
+                        rng = d.get("range", {})
+                        start = rng.get("start", {})
+                        end = rng.get("end", {})
+                        sl = max(start.get("line", 1), 1)
+                        sc = max(start.get("column", 1), 1)
+                        el = max(end.get("line", sl), 1)
+                        ec = max(end.get("column", sc), 1)
+                        ca_tasks.append(self._tc_cached("lsp_code_actions", {
+                            "file_path": file_path,
+                            "start_line": sl, "start_column": sc,
+                            "end_line": el, "end_column": ec,
+                            "kinds": ["quickfix", "refactor", "source.fixAll"],
+                        }, file_path=file_path))
+                    if ca_tasks:
+                        _, n_pending = await _gather_partial(ca_tasks, timeout=INGEST_TIMEOUT)
+                        if n_pending:
+                            log.debug("_ingest_file: %d/%d code-action tasks timed out for %s",
+                                      n_pending, len(ca_tasks), file_path)
+                        else:
+                            self.sqlite_cache.set_ingest_phase(file_path, mtime, sha, 3)
+                    else:
+                        self.sqlite_cache.set_ingest_phase(file_path, mtime, sha, 3)
+                else:
+                    # No diagnostics → Phase 3 trivially done
+                    self.sqlite_cache.set_ingest_phase(file_path, mtime, sha, 3)
 
     async def _background_ingest(self, stop: asyncio.Event):
         """Background task: enumerate all project files and pre-cache LSP data."""
-        # Wait for CWD to be known (set by first client request)
         try:
-            await asyncio.wait_for(self._cwd_event.wait(), timeout=300)
-        except asyncio.TimeoutError:
-            log.warning("file watcher: no CWD received within 5 minutes, aborting ingestion")
-            return
+            # Wait for CWD to be known (set by first client request)
+            try:
+                await asyncio.wait_for(self._cwd_event.wait(), timeout=300)
+            except asyncio.TimeoutError:
+                log.warning("file watcher: no CWD received within 5 minutes, aborting ingestion")
+                return
 
-        cwd = self._project_cwd
-        if not cwd:
-            return
+            cwd = self._project_cwd
+            if not cwd:
+                return
 
-        # Brief delay to let LSP server warm up
-        await asyncio.sleep(2.0)
+            # Brief delay to let LSP server warm up
+            await asyncio.sleep(2.0)
 
-        log.info("background ingestion: starting for %s", cwd)
-        t0 = time.monotonic()
+            log.info("background ingestion: starting for %s", cwd)
+            t0 = time.monotonic()
 
-        files = await asyncio.get_running_loop().run_in_executor(
-            None, _enumerate_files, cwd,
-        )
-        log.info("background ingestion: found %d source files", len(files))
-
-        ingested = 0
-        skipped = 0
-        batch_size = self._fw_batch_size
-
-        for i in range(0, len(files), batch_size):
-            if stop.is_set():
-                break
-            batch = files[i:i + batch_size]
-            await _gather_partial(
-                [self._ingest_file(fp) for fp in batch],
-                timeout=GATHER_TIMEOUT * 2,
+            files = await asyncio.get_running_loop().run_in_executor(
+                None, _enumerate_files, cwd,
             )
-            ingested += len(batch)
-            if ingested % 50 == 0:
-                log.info("background ingestion: %d/%d files processed", ingested, len(files))
-            # Small yield to avoid starving request handlers
-            await asyncio.sleep(0.05)
+            log.info("background ingestion: found %d source files", len(files))
 
-        elapsed = time.monotonic() - t0
-        log.info("background ingestion: done — %d files in %.1fs", ingested, elapsed)
+            ingested = 0
+            batch_size = self._fw_batch_size
 
-        # Start file watcher after initial ingestion
-        if self._fw_enabled and not stop.is_set():
-            self._file_watcher = FileWatcher(cwd, self._change_queue)
-            asyncio.create_task(self._file_watcher.watch(stop))
-            log.info("file watcher: started for %s", cwd)
+            for i in range(0, len(files), batch_size):
+                if stop.is_set():
+                    break
+                batch = files[i:i + batch_size]
+                await _gather_partial(
+                    [self._ingest_file(fp) for fp in batch],
+                    timeout=INGEST_TIMEOUT * 2,
+                )
+                ingested += len(batch)
+                if ingested % 50 == 0:
+                    log.info("background ingestion: %d/%d files processed", ingested, len(files))
+                # Small yield to avoid starving request handlers
+                await asyncio.sleep(0.05)
+
+            elapsed = time.monotonic() - t0
+            log.info("background ingestion: done — %d files in %.1fs", ingested, elapsed)
+
+            # Prune ingest locks that are no longer held
+            self._ingest_locks = {k: v for k, v in self._ingest_locks.items() if v.locked()}
+
+            # Start file watcher after initial ingestion
+            if self._fw_enabled and not stop.is_set():
+                self._file_watcher = FileWatcher(cwd, self._change_queue, self._fw_debounce_ms)
+                self._watch_task = asyncio.create_task(self._file_watcher.watch(stop))
+                log.info("file watcher: started for %s", cwd)
+        finally:
+            self._initial_ingest_done.set()
 
     async def _change_consumer(self, stop: asyncio.Event):
         """Consume file change events from the watcher, debounce, and re-ingest."""
+        # Wait for initial ingestion to complete before processing changes
+        await self._initial_ingest_done.wait()
         debounce_s = self._fw_debounce_ms / 1000.0
 
         while not stop.is_set():
@@ -1196,13 +1263,12 @@ class LSPHooksDaemon:
             batch = [fp for fp in changed_paths if os.path.isfile(fp)]
             if batch:
                 log.info("file watcher: re-ingesting %d changed file(s)", len(batch))
-                # Invalidate L2 cache entries for changed files
-                for fp in batch:
-                    self.sqlite_cache.invalidate_file(fp)
                 await _gather_partial(
                     [self._ingest_file(fp) for fp in batch],
-                    timeout=GATHER_TIMEOUT * 2,
+                    timeout=INGEST_TIMEOUT * 2,
                 )
+                # Prune ingest locks that are no longer held
+                self._ingest_locks = {k: v for k, v in self._ingest_locks.items() if v.locked()}
 
     # --------------- handlers ---------------
 
@@ -1226,7 +1292,7 @@ class LSPHooksDaemon:
 
         # Try pre-populated cache from file watcher first
         cached_data = self.sqlite_cache.get_all_for_file(file_path)
-        if len(cached_data) >= len(CORE_TOOLS):
+        if all(t in cached_data for t in CORE_TOOLS):
             syms_r = cached_data.get("lsp_document_symbols")
             diag_r = cached_data.get("lsp_diagnostics")
             exp_r = cached_data.get("lsp_file_exports")
@@ -1280,12 +1346,8 @@ class LSPHooksDaemon:
 
         # Hover + call hierarchy + signature for ALL visible symbols (no caps)
         if syms_r:
-            visible = _extract_symbols(syms_r)
-            if lsp_start is not None:
-                visible = _filter_symbols_by_range(
-                    visible, lsp_start,
-                    lsp_end if lsp_end is not None else float("inf"),
-                )
+            # Reuse `syms` already extracted and range-filtered above
+            visible = syms if syms else []
             flat = _flatten_symbols(visible) if visible else []
             hover_syms = [s for s in flat
                           if s.get("kind") in ("Function", "Method", "Struct", "Class",

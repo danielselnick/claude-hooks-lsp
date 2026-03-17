@@ -15,7 +15,7 @@ import time
 
 log = logging.getLogger("lsp_hooks_daemon")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 WORKSPACE_TTL = 300.0  # 5 minutes for non-file-scoped entries
 
 # Core tools that the file watcher pre-caches for every file
@@ -53,7 +53,7 @@ def _file_content_sha(path: str) -> str | None:
                     break
                 h.update(chunk)
         return h.hexdigest()
-    except (FileNotFoundError, OSError, PermissionError):
+    except OSError:
         return None
 
 
@@ -90,6 +90,7 @@ class SQLiteCache:
         conn.executescript("""
             DROP TABLE IF EXISTS tool_cache;
             DROP TABLE IF EXISTS schema_version;
+            DROP TABLE IF EXISTS file_ingest_status;
 
             CREATE TABLE schema_version (
                 version INTEGER NOT NULL
@@ -112,6 +113,16 @@ class SQLiteCache:
             CREATE INDEX idx_tool_args ON tool_cache(tool_name, args_hash);
             CREATE INDEX idx_file_path ON tool_cache(file_path);
             CREATE INDEX idx_last_hit ON tool_cache(last_hit_at);
+
+            CREATE TABLE file_ingest_status (
+                file_path TEXT PRIMARY KEY,
+                file_mtime_ns INTEGER NOT NULL,
+                content_sha TEXT NOT NULL,
+                phase1_done INTEGER DEFAULT 0,
+                phase2_done INTEGER DEFAULT 0,
+                phase3_done INTEGER DEFAULT 0,
+                updated_at REAL NOT NULL
+            );
         """)
         conn.execute(
             "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
@@ -228,11 +239,13 @@ class SQLiteCache:
                 (file_path,),
             ).fetchall()
             result = {}
+            current_sha = None  # lazy — computed at most once
             for tool_name, row_mtime, row_sha, result_json in rows:
                 if row_mtime == current_mtime:
                     result[tool_name] = json.loads(result_json)
                 elif row_sha:
-                    current_sha = _file_content_sha(file_path)
+                    if current_sha is None:
+                        current_sha = _file_content_sha(file_path)
                     if current_sha and current_sha == row_sha:
                         result[tool_name] = json.loads(result_json)
             return result
@@ -240,46 +253,82 @@ class SQLiteCache:
             log.warning("sqlite cache get_all_for_file error: %s", e)
             return {}
 
-    def has_fresh_entry(self, file_path: str, mtime_ns: int, content_sha: str) -> bool:
-        """Check if ALL core tools are cached fresh for this file."""
+    def get_ingest_status(self, file_path: str, mtime_ns: int, content_sha: str) -> dict:
+        """Return {phase1: bool, phase2: bool, phase3: bool} if mtime+sha match, else all-False."""
+        default = {"phase1": False, "phase2": False, "phase3": False}
         try:
             conn = self._ensure_conn()
-            rows = conn.execute(
-                "SELECT tool_name, file_mtime_ns, content_sha "
-                "FROM tool_cache WHERE file_path=?",
+            row = conn.execute(
+                "SELECT file_mtime_ns, content_sha, phase1_done, phase2_done, phase3_done "
+                "FROM file_ingest_status WHERE file_path=?",
                 (file_path,),
-            ).fetchall()
-            cached_tools = set()
-            for tool_name, row_mtime, row_sha in rows:
-                if tool_name in CORE_TOOLS:
-                    if row_mtime == mtime_ns or (row_sha and row_sha == content_sha):
-                        cached_tools.add(tool_name)
-            return CORE_TOOLS.issubset(cached_tools)
+            ).fetchone()
+            if row is None:
+                return default
+            row_mtime, row_sha, p1, p2, p3 = row
+            if row_mtime != mtime_ns or row_sha != content_sha:
+                return default
+            return {"phase1": bool(p1), "phase2": bool(p2), "phase3": bool(p3)}
+        except Exception as e:
+            log.warning("sqlite cache get_ingest_status error: %s", e)
+            return default
+
+    def set_ingest_phase(self, file_path: str, mtime_ns: int, content_sha: str, phase: int):
+        """UPSERT to mark a phase as done."""
+        col = f"phase{phase}_done"
+        if col not in ("phase1_done", "phase2_done", "phase3_done"):
+            return
+        try:
+            conn = self._ensure_conn()
+            now = time.time()
+            conn.execute(
+                f"INSERT INTO file_ingest_status "
+                f"(file_path, file_mtime_ns, content_sha, {col}, updated_at) "
+                f"VALUES (?, ?, ?, 1, ?) "
+                f"ON CONFLICT(file_path) DO UPDATE SET "
+                f"file_mtime_ns=excluded.file_mtime_ns, "
+                f"content_sha=excluded.content_sha, "
+                f"{col}=1, updated_at=excluded.updated_at",
+                (file_path, mtime_ns, content_sha, now),
+            )
+            conn.commit()
+        except Exception as e:
+            log.warning("sqlite cache set_ingest_phase error: %s", e)
+
+    def clear_ingest_status(self, file_path: str):
+        """Delete ingest status row for a file."""
+        try:
+            conn = self._ensure_conn()
+            conn.execute("DELETE FROM file_ingest_status WHERE file_path=?", (file_path,))
+            conn.commit()
+        except Exception as e:
+            log.warning("sqlite cache clear_ingest_status error: %s", e)
+
+    def has_fresh_entry(self, file_path: str, mtime_ns: int, content_sha: str) -> bool:
+        """Check if all ingestion phases completed for this file+version."""
+        try:
+            conn = self._ensure_conn()
+            row = conn.execute(
+                "SELECT file_mtime_ns, content_sha, phase1_done, phase2_done, phase3_done "
+                "FROM file_ingest_status WHERE file_path=?",
+                (file_path,),
+            ).fetchone()
+            if row is None:
+                return False
+            row_mtime, row_sha, p1, p2, p3 = row
+            if row_mtime != mtime_ns or row_sha != content_sha:
+                return False
+            return bool(p1 and p2 and p3)
         except Exception as e:
             log.warning("sqlite cache has_fresh_entry error: %s", e)
             return False
-
-    def all_cached_files(self) -> dict[str, tuple[int | None, str | None]]:
-        """Return {file_path: (mtime_ns, content_sha)} for all file-scoped entries."""
-        try:
-            conn = self._ensure_conn()
-            rows = conn.execute(
-                "SELECT DISTINCT file_path, file_mtime_ns, content_sha "
-                "FROM tool_cache WHERE file_path IS NOT NULL"
-            ).fetchall()
-            result = {}
-            for fp, mtime, sha in rows:
-                result[fp] = (mtime, sha)
-            return result
-        except Exception as e:
-            log.warning("sqlite cache all_cached_files error: %s", e)
-            return {}
 
     def invalidate_file(self, file_path: str):
         """Remove all cached entries for a specific file."""
         try:
             conn = self._ensure_conn()
             conn.execute("DELETE FROM tool_cache WHERE file_path=?", (file_path,))
+            conn.execute("DELETE FROM file_ingest_status WHERE file_path=?", (file_path,))
             conn.commit()
         except Exception as e:
             log.warning("sqlite cache invalidate error: %s", e)
@@ -298,6 +347,11 @@ class SQLiteCache:
                     "(SELECT id FROM tool_cache ORDER BY last_hit_at DESC LIMIT ?)",
                     (max_rows,),
                 )
+            # Clean orphaned ingest status rows
+            conn.execute(
+                "DELETE FROM file_ingest_status WHERE file_path NOT IN "
+                "(SELECT DISTINCT file_path FROM tool_cache WHERE file_path IS NOT NULL)"
+            )
             conn.commit()
         except Exception as e:
             log.warning("sqlite cache evict error: %s", e)

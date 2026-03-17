@@ -50,7 +50,7 @@ cd claude-hooks-lsp
 claude /plugin marketplace add "$(pwd)"
 
 # 3. Run the installer (installs npm deps, checks LSP servers, starts daemon)
-python3 install.py
+uv run install.py
 
 # 4. Enable the plugin when prompted, or manually:
 claude /plugin enable lsp-hooks
@@ -122,7 +122,7 @@ At least one LSP server for your language(s):
 | C/C++ | clangd | Xcode CLI tools or `brew install llvm` |
 | Go | gopls | `go install golang.org/x/tools/gopls@latest` |
 
-The installer (`python3 install.py`) will check for these and offer to install any that are missing.
+The installer (`uv run install.py`) will check for these and offer to install any that are missing.
 
 ## Hook Events
 
@@ -157,7 +157,7 @@ tail -f /tmp/lsp-hooks-$(whoami).log
 
 **Restart daemon:**
 ```sh
-python3 lsp_hooks_daemon.py
+uv run lsp_hooks_daemon.py
 ```
 
 **Check if daemon is running:**

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import signal
 import sys
 import tempfile
 import uuid
@@ -76,28 +75,33 @@ def daemon_config(tmp_path):
 # ---------------------------------------------------------------------------
 
 def _patch_mcp_start(monkeypatch):
-    """Monkeypatch MCPClient.start to use python3 for .py mock servers."""
+    """Monkeypatch MCPClient.start to use python3 for .py mock servers.
+
+    Instead of reimplementing start() internals (which diverges when MCPClient
+    changes), we delegate to the real start() and only intercept subprocess
+    creation to swap ``node`` for ``sys.executable``.
+    """
+    import unittest.mock
     import lsp_hooks_daemon as daemon_mod
 
     original_start = daemon_mod.MCPClient.start
 
     async def patched_start(self):
-        # Swap node→python3 for .py mock
         if self.server_path.endswith(".py"):
             self.is_npx = False
-            # Temporarily replace the cmd building
-            original_create = asyncio.create_subprocess_exec
+            orig_exec = asyncio.create_subprocess_exec
 
-            async def mock_create(*args, **kwargs):
-                # Replace ["node", path.py] with [python3, path.py]
-                cmd_list = list(args)
-                if cmd_list and cmd_list[0] == "node":
-                    cmd_list[0] = sys.executable
-                return await original_create(*cmd_list, **kwargs)
+            async def _exec(*args, **kw):
+                args = list(args)
+                # The real start() launches via node; replace with python
+                if args and args[0] == "node":
+                    args[0] = sys.executable
+                return await orig_exec(*args, **kw)
 
-            monkeypatch.setattr(asyncio, "create_subprocess_exec", mock_create)
-
-        await original_start(self)
+            with unittest.mock.patch("asyncio.create_subprocess_exec", side_effect=_exec):
+                await original_start(self)
+        else:
+            await original_start(self)
 
     monkeypatch.setattr(daemon_mod.MCPClient, "start", patched_start)
 
@@ -121,20 +125,8 @@ async def running_daemon(daemon_config, monkeypatch, tmp_path):
     daemon = daemon_mod.LSPHooksDaemon(daemon_config)
     daemon.sqlite_cache = SQLiteCache(db_path)
 
-    stop_event = asyncio.Event()
-    daemon_task = None
-
-    async def run_daemon():
-        try:
-            await daemon.start()
-            # Wait until stopped
-            await stop_event.wait()
-        except asyncio.CancelledError:
-            pass
-        finally:
-            await daemon.cleanup()
-
-    daemon_task = asyncio.create_task(run_daemon())
+    # run() handles start + background tasks + cleanup
+    daemon_task = asyncio.create_task(daemon.run())
 
     # Wait for socket to be ready
     socket_path = daemon_config["socket_path"]
@@ -146,7 +138,7 @@ async def running_daemon(daemon_config, monkeypatch, tmp_path):
         daemon_task.cancel()
         try:
             await daemon_task
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception):
             pass
         pytest.fail("Daemon socket never appeared")
 
@@ -157,8 +149,9 @@ async def running_daemon(daemon_config, monkeypatch, tmp_path):
         "db_path": db_path,
     }
 
-    # Teardown
-    stop_event.set()
+    # Teardown — send SIGINT-like stop via the internal signal handler
+    # Since run() listens on signal handlers, we can't easily trigger those in tests.
+    # Instead, just cancel the task and let it clean up.
     daemon_task.cancel()
     try:
         await asyncio.wait_for(daemon_task, timeout=5.0)

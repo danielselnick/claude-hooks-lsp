@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event pre-write",
+            "command": "uv run ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event pre-write",
             "timeout": 2500
           }
         ]
@@ -16,7 +16,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event pre-read",
+            "command": "uv run ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event pre-read",
             "timeout": 1500
           }
         ]
@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event pre-bash",
+            "command": "uv run ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event pre-bash",
             "timeout": 1000
           }
         ]
@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event pre-grep",
+            "command": "uv run ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event pre-grep",
             "timeout": 2000
           }
         ]
@@ -46,7 +46,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event pre-glob",
+            "command": "uv run ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event pre-glob",
             "timeout": 2000
           }
         ]
@@ -57,7 +57,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event prompt",
+            "command": "uv run ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event prompt",
             "timeout": 2000
           }
         ]
@@ -68,7 +68,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event session-start",
+            "command": "uv run ${CLAUDE_PLUGIN_ROOT}/lsp_hooks.py --event session-start",
             "timeout": 3000
           }
         ]

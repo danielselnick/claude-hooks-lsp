@@ -48,6 +48,7 @@ class TestCacheRegression:
         assert resp1["ok"] is True
         assert resp2["ok"] is True
         assert resp1.get("context") == resp2.get("context")
+        assert resp1.get("context"), "Expected non-empty context from pre-read"
 
     async def test_l1_cache_invalidation_on_write(self, running_daemon, tmp_project):
         """Pre-write for a file should invalidate L1 cache for that file."""
@@ -64,6 +65,10 @@ class TestCacheRegression:
                                   tool_input={"file_path": fp, "old_string": "x", "new_string": "y"},
                                   cwd=str(tmp_project))
         assert resp_w["ok"] is True
+        # Verify L1 cache was actually invalidated
+        daemon = running_daemon["daemon"]
+        l1_key = f"pre-read:{fp}"
+        assert daemon.cache.get(l1_key) is None, "L1 cache should be invalidated after write"
 
         # Second read — should not be stale
         resp2 = await send_query(socket_path, "pre-read", file_path=fp,
@@ -346,7 +351,7 @@ class TestMCPRecovery:
             await daemon.mcp.process.wait()
 
         # Give watchdog time to notice and restart
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(6.0)
 
         # Should recover
         resp2 = await send_query(socket_path, "pre-read", file_path=fp,
@@ -401,6 +406,19 @@ class TestHandlerRegression:
             cwd=str(tmp_project),
         )
         assert resp["ok"] is True
+        context = resp.get("context", "")
+        # Mock has MyClass at line 12 — with offset=1, limit=5 (lines 1-5), the symbol tree
+        # should only show `main` (L1), not MyClass (L12). Exports/imports are file-level and unfiltered.
+        if context:
+            # Extract just the symbol tree lines (before "Exports:" section)
+            tree_lines = []
+            for line in context.split("\n"):
+                if line.startswith("Exports:") or line.startswith("Imports:"):
+                    break
+                tree_lines.append(line)
+            tree_section = "\n".join(tree_lines)
+            assert "MyClass" not in tree_section, \
+                f"MyClass at line 12 should be filtered out of symbol tree for range 1-5, got: {tree_section}"
 
     async def test_session_start_returns_symbols(self, running_daemon, tmp_project):
         """Session start should return symbol overview from workspace."""
@@ -428,11 +446,143 @@ class TestHandlerRegression:
         )
         assert resp["ok"] is True
         context = resp.get("context", "")
-        # Mock returns severity 1 (Error), 2 (Warning), 3 (Info), 4 (Hint)
-        # At least some should appear with severity labels
-        if context:
-            # If diagnostics are shown, they should include the warning too
-            has_diag = "unused variable" in context or "missing semicolon" in context
-            if has_diag:
-                # We expect both error and warning to appear (no filtering to error only)
-                pass  # just verify no crash
+        assert context, "pre-read should return non-empty context"
+        # Mock returns severity 1 (Error) "missing semicolon" and severity 2 (Warning) "unused variable"
+        # Both should appear — verify at least one diagnostic is present
+        has_error = "missing semicolon" in context
+        has_warning = "unused variable" in context
+        assert has_error or has_warning, f"Expected diagnostics in context, got: {context[:200]}"
+
+
+# ===========================================================================
+# Ingest Completeness Tests
+# ===========================================================================
+
+class TestIngestCompleteness:
+    """Tests for per-phase ingestion tracking (file_ingest_status table)."""
+
+    async def test_phase2_incomplete_allows_retry(self, tmp_path):
+        """Phase 1 done + Phase 2 not done → has_fresh_entry returns False."""
+        from lsp_hooks_cache import SQLiteCache
+
+        db_path = str(tmp_path / "test.db")
+        cache = SQLiteCache(db_path)
+        try:
+            test_file = tmp_path / "test.py"
+            test_file.write_text("def foo(): pass")
+            mtime = os.stat(str(test_file)).st_mtime_ns
+
+            import hashlib
+            sha = hashlib.sha256(test_file.read_bytes()).hexdigest()
+
+            # Mark only phase 1 done
+            cache.set_ingest_phase(str(test_file), mtime, sha, 1)
+
+            # has_fresh_entry should return False (phase 2 and 3 not done)
+            assert cache.has_fresh_entry(str(test_file), mtime, sha) is False
+
+            # get_ingest_status should show phase1=True, phase2=False, phase3=False
+            status = cache.get_ingest_status(str(test_file), mtime, sha)
+            assert status["phase1"] is True
+            assert status["phase2"] is False
+            assert status["phase3"] is False
+        finally:
+            cache.close()
+
+    async def test_all_phases_complete_is_fresh(self, tmp_path):
+        """All 3 phases done → has_fresh_entry returns True."""
+        from lsp_hooks_cache import SQLiteCache
+
+        db_path = str(tmp_path / "test.db")
+        cache = SQLiteCache(db_path)
+        try:
+            test_file = tmp_path / "test.py"
+            test_file.write_text("def bar(): pass")
+            mtime = os.stat(str(test_file)).st_mtime_ns
+
+            import hashlib
+            sha = hashlib.sha256(test_file.read_bytes()).hexdigest()
+
+            # Mark all phases done
+            cache.set_ingest_phase(str(test_file), mtime, sha, 1)
+            cache.set_ingest_phase(str(test_file), mtime, sha, 2)
+            cache.set_ingest_phase(str(test_file), mtime, sha, 3)
+
+            # has_fresh_entry should return True
+            assert cache.has_fresh_entry(str(test_file), mtime, sha) is True
+
+            status = cache.get_ingest_status(str(test_file), mtime, sha)
+            assert status["phase1"] is True
+            assert status["phase2"] is True
+            assert status["phase3"] is True
+        finally:
+            cache.close()
+
+    async def test_invalidate_clears_status(self, tmp_path):
+        """invalidate_file should also clear ingest status."""
+        from lsp_hooks_cache import SQLiteCache
+
+        db_path = str(tmp_path / "test.db")
+        cache = SQLiteCache(db_path)
+        try:
+            test_file = tmp_path / "test.py"
+            test_file.write_text("class Baz: pass")
+            mtime = os.stat(str(test_file)).st_mtime_ns
+
+            import hashlib
+            sha = hashlib.sha256(test_file.read_bytes()).hexdigest()
+
+            # Set all phases done
+            cache.set_ingest_phase(str(test_file), mtime, sha, 1)
+            cache.set_ingest_phase(str(test_file), mtime, sha, 2)
+            cache.set_ingest_phase(str(test_file), mtime, sha, 3)
+            assert cache.has_fresh_entry(str(test_file), mtime, sha) is True
+
+            # Invalidate
+            cache.invalidate_file(str(test_file))
+
+            # Status should be cleared
+            assert cache.has_fresh_entry(str(test_file), mtime, sha) is False
+            status = cache.get_ingest_status(str(test_file), mtime, sha)
+            assert status["phase1"] is False
+            assert status["phase2"] is False
+            assert status["phase3"] is False
+        finally:
+            cache.close()
+
+    async def test_stale_mtime_returns_not_fresh(self, tmp_path):
+        """Different mtime/sha → all phases return False."""
+        from lsp_hooks_cache import SQLiteCache
+
+        db_path = str(tmp_path / "test.db")
+        cache = SQLiteCache(db_path)
+        try:
+            test_file = tmp_path / "test.py"
+            test_file.write_text("x = 1")
+            mtime = os.stat(str(test_file)).st_mtime_ns
+
+            import hashlib
+            sha = hashlib.sha256(test_file.read_bytes()).hexdigest()
+
+            # Mark all phases done
+            cache.set_ingest_phase(str(test_file), mtime, sha, 1)
+            cache.set_ingest_phase(str(test_file), mtime, sha, 2)
+            cache.set_ingest_phase(str(test_file), mtime, sha, 3)
+
+            # Modify the file
+            time.sleep(0.01)
+            test_file.write_text("x = 2")
+            new_mtime = os.stat(str(test_file)).st_mtime_ns
+            new_sha = hashlib.sha256(test_file.read_bytes()).hexdigest()
+
+            # Old version still fresh
+            assert cache.has_fresh_entry(str(test_file), mtime, sha) is True
+
+            # New version should not be fresh
+            assert cache.has_fresh_entry(str(test_file), new_mtime, new_sha) is False
+            status = cache.get_ingest_status(str(test_file), new_mtime, new_sha)
+            assert status["phase1"] is False
+            assert status["phase2"] is False
+            assert status["phase3"] is False
+        finally:
+            cache.close()

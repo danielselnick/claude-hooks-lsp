@@ -198,6 +198,34 @@ def install_npm_deps():
         return False
 
 
+def install_python_deps():
+    """Install Python dependencies (watchfiles for file watcher)."""
+    print(_bold("\n=== Python Dependencies ==="))
+    try:
+        import watchfiles  # noqa: F401
+        print(f"  {_green('✓')} watchfiles already installed")
+        return True
+    except ImportError:
+        pass
+
+    print(f"  Installing watchfiles (Rust-backed file watcher)...")
+    # Prefer uv (already a prerequisite) over pip
+    uv = shutil.which("uv")
+    if uv:
+        cmd = ["uv", "pip", "install", "--python", sys.executable, "watchfiles"]
+    else:
+        cmd = [sys.executable, "-m", "pip", "install", "watchfiles"]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        print(f"  {_green('✓')} watchfiles installed")
+        return True
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode() if e.stderr else ""
+        print(f"  {_yellow('!')} {' '.join(cmd[:3])} failed: {stderr[:200]}")
+        print(f"  File watcher will be disabled — caching still works on-demand")
+        return False
+
+
 def install_lsp_servers():
     """Check and optionally install LSP language servers."""
     print(_bold("\n=== LSP Language Servers ==="))
@@ -351,8 +379,13 @@ def start_daemon():
     env = dict(os.environ, CLAUDE_PLUGIN_ROOT=str(plugin_dir))
 
     print(f"  Starting daemon...")
+    uv = shutil.which("uv")
+    if uv:
+        cmd = [uv, "run", str(daemon_script)]
+    else:
+        cmd = [sys.executable, str(daemon_script)]
     proc = subprocess.Popen(
-        [sys.executable, str(daemon_script)],
+        cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         start_new_session=True,
@@ -382,7 +415,7 @@ def print_summary():
     print(f"    claude /plugin marketplace add {plugin_dir}")
     print()
     print(f"  To restart daemon:")
-    print(f"    python3 {plugin_dir / 'lsp_hooks_daemon.py'}")
+    print(f"    uv run {plugin_dir / 'lsp_hooks_daemon.py'}")
     print(f"  To view logs:")
     print(f"    tail -f {LOG_PATH}")
     print()
@@ -404,6 +437,7 @@ def main():
         print(f"\n{_red('Aborting:')} npm dependencies not available.")
         sys.exit(1)
 
+    install_python_deps()
     install_lsp_servers()
     cleanup_old_hooks()
     start_daemon()
